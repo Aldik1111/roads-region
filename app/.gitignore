@@ -1,0 +1,14 @@
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+.venv/
+__pycache__/
+.pytest_cache/
+backend/data/
+backend/uploads/
+*.db
+*.db-*
+.env
+work/
+logs/
+*.pid
