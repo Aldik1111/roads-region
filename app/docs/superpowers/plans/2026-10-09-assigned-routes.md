@@ -18,4 +18,6 @@
 - [x] Dispatcher: implement RoutePlanner and responsive map/candidate cards/results. Update Operations route labels/filter. Verify build and choices single/multiple/reset/error.
 - [x] Inspector: route list/select/start/resume/finish, correct route association and list scoping. Preserve foreground GPS and exact request retries. Verify build and active assignment guards.
 - [x] Root: shared types, navigation, shared map fit/captions, API integration review, fresh build/tests, desktop/mobile browser workflow including routing service failure. Review each agent diff.
-- [ ] Save evidence/docs; restart local app; sync project to existing GitHub app/ preserving repository docs, commit/push and verify remote hash.
+- [x] Save evidence/docs; restart local app; sync project to existing GitHub app/ preserving repository docs, commit/push and verify remote hash.
+
+Publication verified: origin/main 52456cc6daf4181d326f202a263820564b291589. Local health returned ok=true after GPS checks.
