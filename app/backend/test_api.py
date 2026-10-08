@@ -288,3 +288,200 @@ def test_missing_photo_file_returns_json_404():
     assert response.status_code == 404
     assert response.headers["content-type"].startswith("application/json")
     assert response.json()["code"] == "NOT_FOUND"
+
+
+def osrm_response(*, multiple=False):
+    routes = [{
+        "geometry": {"type": "LineString", "coordinates": [[65.5001, 44.8001], [65.5100, 44.8100], [65.5200, 44.8200], [65.5501, 44.8501]]},
+        "distance": 6400, "duration": 480,
+        "legs": [{"steps": [{"name": "Абая"}, {"name": "Сырдарья"}]}],
+    }]
+    if multiple:
+        routes.append({
+            "geometry": {"type": "LineString", "coordinates": [[65.5001, 44.8001], [65.5100, 44.8100], [65.5350, 44.8350], [65.5501, 44.8501]]},
+            "distance": 7100, "duration": 530,
+            "legs": [{"steps": [{"name": "Жибек жолы"}]}],
+        })
+        routes.append({
+            "geometry": {"type": "LineString", "coordinates": [[65.5001, 44.8001], [65.5100, 44.8100], [65.5200, 44.8200], [65.5501, 44.8501]]},
+            "distance": 6450, "duration": 490,
+            "legs": [{"steps": [{"name": "Дублирующий ответ"}]}],
+        })
+    return {
+        "code": "Ok", "routes": routes,
+        "waypoints": [{"location": [65.5001, 44.8001]}, {"location": [65.5501, 44.8501]}],
+    }
+
+
+def preview_route(monkeypatch, *, multiple=False):
+    monkeypatch.setattr(main, "fetch_osrm_routes", lambda start, end: osrm_response(multiple=multiple), raising=False)
+    return client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5}, "end": {"lat": 44.85, "lng": 65.55},
+    })
+
+
+def publish_route(preview, option_id, inspector_id="u-inspector", name="Проверка R-02", notes="Северная объездная"):
+    return client.post("/api/routes", json={
+        "name": name, "notes": notes, "inspector_id": inspector_id,
+        "preview_id": preview["id"], "option_id": option_id,
+    })
+
+
+def test_route_preview_persists_osrm_alternatives_and_requires_explicit_choice(monkeypatch):
+    login("dispatcher@roads.local")
+    preview = preview_route(monkeypatch, multiple=True)
+    assert preview.status_code == 200, preview.text
+    data = preview.json()
+    assert data["provider"] == "OSRM"
+    assert data["start"] == {"lat": 44.8001, "lng": 65.5001}
+    assert data["end"] == {"lat": 44.8501, "lng": 65.5501}
+    assert len(data["options"]) == 2
+    assert data["options"][0]["distance_m"] == 6400
+    assert data["decision_points"]
+    assert abs(data["decision_points"][0]["lat"] - 44.81) < 1e-6
+    assert abs(data["decision_points"][0]["lng"] - 65.51) < 1e-6
+
+    missing = publish_route(data, None)
+    assert missing.status_code == 422
+    assert missing.json()["code"] == "OPTION_REQUIRED"
+    selected = data["options"][1]
+    created = publish_route(data, selected["id"])
+    assert created.status_code == 200, created.text
+    route = created.json()
+    assert route["geometry"] == selected["geometry"]
+    assert route["source"] == "osrm"
+    assert route["duration_min"] == 9
+    repeated = publish_route(data, selected["id"])
+    assert repeated.status_code == 200
+    assert repeated.json()["id"] == route["id"]
+    changed = publish_route(data, data["options"][0]["id"], name="Другой маршрут")
+    assert changed.status_code == 409
+    assert changed.json()["code"] == "PREVIEW_ALREADY_USED"
+
+
+def test_route_preview_rejects_invalid_points_and_provider_failures(monkeypatch):
+    login("dispatcher@roads.local")
+    identical = client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5}, "end": {"lat": 44.8, "lng": 65.5},
+    })
+    assert identical.status_code == 422
+    outside = client.post("/api/routes/preview", json={
+        "start": {"lat": 91, "lng": 65.5}, "end": {"lat": 44.85, "lng": 65.55},
+    })
+    assert outside.status_code == 422
+
+    monkeypatch.setattr(main, "fetch_osrm_routes", lambda start, end: {"code": "Ok", "routes": [], "waypoints": []}, raising=False)
+    no_route = client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5}, "end": {"lat": 44.85, "lng": 65.55},
+    })
+    assert no_route.status_code == 422
+    assert no_route.json()["code"] == "NO_ROUTE"
+
+    def timeout(start, end):
+        raise TimeoutError("OSRM request timed out")
+    monkeypatch.setattr(main, "fetch_osrm_routes", timeout, raising=False)
+    unavailable = client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5}, "end": {"lat": 44.85, "lng": 65.55},
+    })
+    assert unavailable.status_code == 503
+
+    monkeypatch.setattr(main, "fetch_osrm_routes", lambda start, end: (_ for _ in ()).throw(ValueError("malformed JSON")), raising=False)
+    malformed = client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5}, "end": {"lat": 44.85, "lng": 65.55},
+    })
+    assert malformed.status_code == 503
+    assert malformed.json()["code"] == "INVALID_ROUTING_RESPONSE"
+
+
+def test_osrm_http_400_no_route_is_reported_as_no_route(monkeypatch):
+    class ProviderError:
+        is_error = True
+
+        def json(self):
+            return {"code": "NoRoute", "message": "No route found"}
+
+        def raise_for_status(self):
+            raise AssertionError("NoRoute should be parsed before HTTP status")
+
+    monkeypatch.setattr(main.httpx, "get", lambda *args, **kwargs: ProviderError())
+    login("dispatcher@roads.local")
+    response = client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5}, "end": {"lat": 44.85, "lng": 65.55},
+    })
+    assert response.status_code == 422
+    assert response.json()["code"] == "NO_ROUTE"
+
+
+def test_routes_are_role_scoped_and_inspection_is_single_active_per_inspector(monkeypatch):
+    login("inspector@roads.local")
+    forbidden_preview = client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5}, "end": {"lat": 44.85, "lng": 65.55},
+    })
+    assert forbidden_preview.status_code == 403
+    assert client.get("/api/bootstrap").json()["inspectors"] == []
+
+    with SessionLocal() as db:
+        if not db.get(main.UserRow, "u-inspector-2"):
+            db.add(main.UserRow(id="u-inspector-2", name="Демо инспектор 2", email="inspector2@roads.local", role="inspector", contractor_id=None, password_hash=main.hash_password("RoadsDemo2026!")))
+            db.commit()
+
+    login("dispatcher@roads.local")
+    assert len(client.get("/api/bootstrap").json()["inspectors"]) >= 2
+    p1 = preview_route(monkeypatch).json()
+    p2 = preview_route(monkeypatch).json()
+    p3 = preview_route(monkeypatch).json()
+    route1 = publish_route(p1, p1["options"][0]["id"], inspector_id="u-inspector").json()
+    route2 = publish_route(p2, p2["options"][0]["id"], inspector_id="u-inspector-2", name="Демо второй маршрут").json()
+    route3 = publish_route(p3, p3["options"][0]["id"], inspector_id="u-inspector", name="Демо третий маршрут").json()
+    dispatcher_routes = client.get("/api/routes").json()
+    assert route1["id"] in [route["id"] for route in dispatcher_routes]
+    assert route2["id"] in [route["id"] for route in dispatcher_routes]
+
+    login("inspector@roads.local")
+    own_routes = client.get("/api/routes").json()
+    assert route1["id"] in [route["id"] for route in own_routes]
+    assert route3["id"] in [route["id"] for route in own_routes]
+    assert route2["id"] not in [route["id"] for route in own_routes]
+    active_before = client.get("/api/inspections").json()
+    for item in active_before:
+        if item["status"] == "active":
+            client.post(f"/api/inspections/{item['id']}/finish", json={"confirmed": True})
+    first = client.post("/api/inspections", json={"section_id": route1["id"]})
+    assert first.status_code == 200, first.text
+    assert client.post("/api/inspections", json={"section_id": route1["id"]}).json()["id"] == first.json()["id"]
+    other_active = client.post("/api/inspections", json={"section_id": route3["id"]})
+    assert other_active.status_code == 409
+    assert other_active.json()["code"] == "ACTIVE_INSPECTION"
+    assert client.get(f"/api/routes/{route2['id']}/results").status_code == 404
+
+
+def test_assigned_route_results_preserve_geometry_inspections_and_defects(monkeypatch):
+    login("dispatcher@roads.local")
+    preview = preview_route(monkeypatch).json()
+    route = publish_route(preview, preview["options"][0]["id"]).json()
+    login("inspector@roads.local")
+    for existing in client.get("/api/inspections").json():
+        if existing["status"] == "active":
+            client.post(f"/api/inspections/{existing['id']}/finish", json={"confirmed": True})
+    inspection = client.post("/api/inspections", json={"section_id": route["id"]}).json()
+    assert "id" in inspection, inspection
+    point = {"client_id": "route-result-point", "lat": 44.82, "lng": 65.52, "recorded_at": "2026-10-09T08:00:00Z", "accuracy_m": 5}
+    points = client.post(f"/api/inspections/{inspection['id']}/points", json={"points": [point]})
+    assert points.status_code == 200
+    photo = upload_png()
+    defect = client.post("/api/defects", headers={"Idempotency-Key": "assigned-route-defect"}, json={
+        "section_id": route["id"], "inspection_id": inspection["id"], "type": "Трещина",
+        "description": "Демо: трещина на назначенном маршруте", "lat": 44.82, "lng": 65.52,
+        "location_source": "gps", "observed_at": "2026-10-09T08:01:00Z", "photo_ids": [photo["id"]],
+    })
+    assert defect.status_code == 200, defect.text
+    finished = client.post(f"/api/inspections/{inspection['id']}/finish", json={"confirmed": True})
+    assert finished.status_code == 200
+
+    login("dispatcher@roads.local")
+    result = client.get(f"/api/routes/{route['id']}/results")
+    assert result.status_code == 200, result.text
+    data = result.json()
+    assert data["route"]["geometry"] == route["geometry"]
+    assert data["inspections"][0]["points"] == [point]
+    assert any(item["id"] == defect.json()["id"] for item in data["defects"])

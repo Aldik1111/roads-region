@@ -1,6 +1,9 @@
 import type { Photo } from './types';
+let mutationGuard: (() => string | null) | null = null;
+export function setMutationGuard(guard: (() => string | null) | null) { mutationGuard = guard; }
 export class ApiError extends Error{code:string;details:unknown;constructor(message:string,code='NETWORK_ERROR',details?:unknown){super(message);this.code=code;this.details=details}}
 async function request<T>(path:string,options:RequestInit={}):Promise<T>{
+ if(options.method && options.method!=='GET' && path!=='/logout' && path!=='/login') { const reason=mutationGuard?.(); if(reason) throw new ApiError(reason,'GPS_REQUIRED'); }
  let response:Response;
  try{response=await fetch('/api'+path,{credentials:'include',...options})}catch{throw new ApiError('Не удалось связаться с сервером. Проверьте соединение и повторите попытку.')}
  const data=await response.json().catch(()=>null);

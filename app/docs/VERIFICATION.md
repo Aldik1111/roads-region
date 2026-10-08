@@ -1,5 +1,7 @@
 # Проверка MVP — 8 октября 2026
 
+Обновление 9 октября: маршруты и обязательный GPS — [ROUTES-VERIFICATION.md](ROUTES-VERIFICATION.md), [GPS-VERIFICATION.md](GPS-VERIFICATION.md). Сейчас проходят 16 серверных тестов; ниже сохранены результаты первоначальной проверки.
+
 ## Автоматические проверки
 
 - `npm run build`: TypeScript и production-сборка Vite проходят. Итоговый JS около 463 КБ (138 КБ gzip), CSS около 65 КБ.

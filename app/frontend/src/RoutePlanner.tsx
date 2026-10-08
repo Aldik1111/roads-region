@@ -1,0 +1,311 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject } from 'react';
+import { MapContainer, Marker, Polyline, Popup, TileLayer, useMap, useMapEvents } from 'react-leaflet';
+import L from 'leaflet';
+import { AlertTriangle, ArrowDownRight, ArrowRight, Check, Clock3, LocateFixed, MapPin, RefreshCw, Route as RouteIcon, Ruler, UserRound, X } from 'lucide-react';
+import { ApiError, api } from './api';
+import { formatDate, MapView, StatusBadge } from './components';
+import { useDeviceLocation } from './geolocation';
+import type { Bootstrap, Inspection, RouteOption, RoutePoint, RoutePreview, RouteResults, Section, User } from './types';
+import './route-planner.css';
+
+type Props = { user: User };
+type Notice = { kind: 'error' | 'success' | 'warning'; text: string } | null;
+type PublishInput = { name: string; notes: string; inspector_id: string; preview_id: string; option_id: string };
+type PointName = 'start' | 'end';
+const ROUTE_COLORS = ['#267c70', '#d18b28', '#566ca5', '#b65c52', '#7d68a5', '#4d8760'];
+const DEFAULT_CENTER: [number, number] = [48, 67];
+const pointLabel = (point?: RoutePoint | null) => point ? `${point.lat.toFixed(6)}, ${point.lng.toFixed(6)}` : 'Нажмите на карту';
+const toLatLng = (point: RoutePoint): [number, number] => [point.lat, point.lng];
+const fromCoordinates = (coordinates: number[][]) => coordinates.map(([lng, lat]) => [lat, lng] as [number, number]);
+const routeState: Record<Section['state'], string> = { assigned: 'Назначен', in_progress: 'Осматривается', completed: 'Завершён' };
+const routeDate = (value?: string | null) => value ? formatDate(value) : '—';
+const errorText = (error: unknown) => error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Не удалось выполнить запрос. Повторите попытку.';
+const meters = (value: number) => value >= 1000 ? `${(value / 1000).toLocaleString('ru-RU', { maximumFractionDigits: 1 })} км` : `${Math.round(value)} м`;
+const minutes = (seconds: number) => {
+  const total = Math.max(1, Math.round(seconds / 60));
+  const h = Math.floor(total / 60), m = total % 60;
+  return h ? `${h} ч ${m ? `${m} мин` : ''}`.trim() : `${m} мин`;
+};
+const distanceBetween = (a: RoutePoint, b: RoutePoint) => {
+  const rad = (n: number) => n * Math.PI / 180;
+  const dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 12742000 * Math.asin(Math.sqrt(x));
+};
+const keyOf = (point?: RoutePoint | null) => point ? `${point.lat.toFixed(6)},${point.lng.toFixed(6)}` : '';
+
+export default function RoutePlanner({ user }: Props) {
+  const deviceLocation = useDeviceLocation();
+  const [inspectors, setInspectors] = useState<User[]>([]);
+  const [routes, setRoutes] = useState<Section[]>([]);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [routesError, setRoutesError] = useState('');
+  const [refreshing, setRefreshing] = useState(false);
+  const [start, setStart] = useState<RoutePoint | null>(null);
+  const [end, setEnd] = useState<RoutePoint | null>(null);
+  const [startLatInput, setStartLatInput] = useState('');
+  const [startLngInput, setStartLngInput] = useState('');
+  const [endLatInput, setEndLatInput] = useState('');
+  const [endLngInput, setEndLngInput] = useState('');
+  const [pointError, setPointError] = useState('');
+  const [pointMode, setPointMode] = useState<PointName>('start');
+  const [preview, setPreview] = useState<RoutePreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState('');
+  const [selectedOptionId, setSelectedOptionId] = useState<string | null>(null);
+  const [previewRevision, setPreviewRevision] = useState(0);
+  const [name, setName] = useState('');
+  const [notes, setNotes] = useState('');
+  const [inspectorId, setInspectorId] = useState('');
+  const [publishError, setPublishError] = useState('');
+  const [publishBusy, setPublishBusy] = useState(false);
+  const [pendingPublish, setPendingPublish] = useState<PublishInput | null>(null);
+  const [publishSuccess, setPublishSuccess] = useState('');
+  const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
+  const [results, setResults] = useState<RouteResults | null>(null);
+  const [resultsLoading, setResultsLoading] = useState(false);
+  const [resultsError, setResultsError] = useState('');
+  const [resultsRevision, setResultsRevision] = useState(0);
+  const [selectedInspectionId, setSelectedInspectionId] = useState<string | null>(null);
+  const [routeSearch, setRouteSearch] = useState('');
+  const [routeStateFilter, setRouteStateFilter] = useState('all');
+  const [layout, setLayout] = useState<'plan' | 'routes' | 'results'>('plan');
+  const previewSequence = useRef(0);
+  const resultSequence = useRef(0);
+  const mapInteracted = useRef(false);
+
+  const loadPage = useCallback(async (quiet = false) => {
+    if (quiet) setRefreshing(true); else setInitialLoading(true);
+    setRoutesError('');
+    try {
+      const [boot, rows] = await Promise.all([api.get<Bootstrap>('/bootstrap'), api.get<Section[]>('/routes')]);
+      setInspectors(boot.inspectors ?? []);
+      setRoutes(rows);
+      setSelectedRouteId((current) => current && rows.some((row) => row.id === current) ? current : rows[0]?.id ?? null);
+      setInspectorId((current) => current && boot.inspectors.some((inspector) => inspector.id === current) ? current : boot.inspectors[0]?.id ?? '');
+      if (quiet) setResultsRevision((revision) => revision + 1);
+    } catch (error) { setRoutesError(errorText(error)); }
+    finally { setInitialLoading(false); setRefreshing(false); }
+  }, []);
+
+  useEffect(() => { void loadPage(); }, [loadPage]);
+
+  const previewStartKey = keyOf(start), previewEndKey = keyOf(end);
+  useEffect(() => {
+    if (!start || !end) {
+      previewSequence.current += 1;
+      setPreview(null); setSelectedOptionId(null); setPreviewLoading(false); setPreviewError('');
+      return;
+    }
+    if (distanceBetween(start, end) < 5) {
+      previewSequence.current += 1;
+      setPreview(null); setSelectedOptionId(null); setPreviewLoading(false);
+      setPreviewError('Укажите две разные точки дороги.');
+      return;
+    }
+    const sequence = ++previewSequence.current;
+    setPreview(null); setSelectedOptionId(null); setPreviewError(''); setPreviewLoading(true); setPublishSuccess('');
+    const from = { ...start }, to = { ...end };
+    void api.post<RoutePreview>('/routes/preview', { start: from, end: to }).then((value) => {
+      if (sequence !== previewSequence.current) return;
+      if (!Array.isArray(value.options) || value.options.length === 0) {
+        setPreviewError('Сервис маршрутизации не вернул варианты. Попробуйте выбрать другие точки.');
+        return;
+      }
+      setPreview(value);
+      if (value.options.length === 1) setSelectedOptionId(value.options[0].id);
+    }).catch((error: unknown) => {
+      if (sequence === previewSequence.current) setPreviewError(errorText(error));
+    }).finally(() => {
+      if (sequence === previewSequence.current) setPreviewLoading(false);
+    });
+    return () => { if (sequence === previewSequence.current) previewSequence.current += 1; };
+    // Use rounded coordinates so map pointer jitter doesn't trigger duplicate previews.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewStartKey, previewEndKey, previewRevision]);
+
+  useEffect(() => {
+    if (!selectedRouteId) { resultSequence.current += 1; setResults(null); setResultsError(''); return; }
+    const sequence = ++resultSequence.current;
+    setResultsLoading(true); setResultsError(''); setResults(null); setSelectedInspectionId(null);
+    void api.get<RouteResults>(`/routes/${selectedRouteId}/results`).then((data) => {
+      if (sequence !== resultSequence.current) return;
+      setResults(data);
+      setSelectedInspectionId(data.inspections[0]?.id ?? null);
+    }).catch((error: unknown) => {
+      if (sequence === resultSequence.current) setResultsError(errorText(error));
+    }).finally(() => { if (sequence === resultSequence.current) setResultsLoading(false); });
+    return () => { if (sequence === resultSequence.current) resultSequence.current += 1; };
+  }, [selectedRouteId, resultsRevision]);
+
+  const filteredRoutes = useMemo(() => routes.filter((route) => {
+    const needle = routeSearch.trim().toLocaleLowerCase('ru');
+    return (!needle || `${route.name} ${route.code} ${route.inspector_name}`.toLocaleLowerCase('ru').includes(needle)) && (routeStateFilter === 'all' || route.state === routeStateFilter);
+  }), [routes, routeSearch, routeStateFilter]);
+  const displayedOptions = useMemo(() => preview?.options ?? [], [preview]);
+  const selectedInspection = results?.inspections.find((inspection) => inspection.id === selectedInspectionId) ?? null;
+  const snappedDistance = preview && start && end ? Math.max(distanceBetween(start, preview.start), distanceBetween(end, preview.end)) : 0;
+
+  const resetPreview = () => {
+    previewSequence.current += 1;
+    setPreview(null); setPreviewError(''); setSelectedOptionId(null); setPreviewLoading(false); setPendingPublish(null); setPublishError(''); setPublishSuccess(''); setPreviewRevision((revision) => revision + 1);
+  };
+  const changeEndpoint = (which: PointName, value: RoutePoint) => {
+    mapInteracted.current = true;
+    const current = which === 'start' ? start : end;
+    const roundedPointChanged = keyOf(current) !== keyOf(value);
+    setPublishError(''); setPendingPublish(null); setPublishSuccess('');
+    if (roundedPointChanged) { setPreview(null); setSelectedOptionId(null); }
+    else if (!preview && !previewLoading && start && end) setPreviewRevision((revision) => revision + 1);
+    if (which === 'start') { setStart(value); setStartLatInput(value.lat.toFixed(6)); setStartLngInput(value.lng.toFixed(6)); }
+    else { setEnd(value); setEndLatInput(value.lat.toFixed(6)); setEndLngInput(value.lng.toFixed(6)); }
+    setPointError('');
+  };
+  const applyManualPoint = (which: PointName) => {
+    const latRaw = which === 'start' ? startLatInput : endLatInput;
+    const lngRaw = which === 'start' ? startLngInput : endLngInput;
+    const lat = Number(latRaw), lng = Number(lngRaw);
+    if (!latRaw.trim() || !lngRaw.trim() || !Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      setPointError('Введите широту от −90 до 90 и долготу от −180 до 180.');
+      return;
+    }
+    changeEndpoint(which, { lat, lng });
+  };
+  const handleMapClick = (lat: number, lng: number) => {
+    if (publishBusy || pendingPublish) return;
+    const value = { lat, lng };
+    changeEndpoint(pointMode, value);
+    if (pointMode === 'start' && !end) setPointMode('end');
+  };
+
+  async function publish() {
+    if (publishBusy || previewLoading || !preview || !selectedOptionId || !inspectorId || !name.trim()) return;
+    const body = pendingPublish ?? { name: name.trim(), notes: notes.trim(), inspector_id: inspectorId, preview_id: preview.id, option_id: selectedOptionId };
+    setPendingPublish(body); setPublishBusy(true); setPublishError(''); setPublishSuccess('');
+    try {
+      const route = await api.post<Section>('/routes', body);
+      setPendingPublish(null); setPublishSuccess(`Маршрут «${route.name}» назначен ${route.inspector_name}.`);
+      setRoutes((rows) => [route, ...rows.filter((item) => item.id !== route.id)]);
+      setStart(null); setEnd(null); setStartLatInput(''); setStartLngInput(''); setEndLatInput(''); setEndLngInput(''); setPointMode('start'); setPreview(null); setSelectedOptionId(null);
+      setSelectedRouteId(route.id); setLayout('results');
+      await loadPage(true);
+    } catch (error) {
+      const refreshPreview = error instanceof ApiError && (error.code === 'PREVIEW_ALREADY_USED' || error.code === 'PREVIEW_EXPIRED');
+      if (refreshPreview) {
+        setPendingPublish(null); setPreview(null); setSelectedOptionId(null); setPreviewRevision((revision) => revision + 1);
+      }
+      setPublishError(`${errorText(error)} ${refreshPreview ? 'Обновляем варианты маршрута. Выберите вариант и отправьте назначение заново.' : 'Повтор сохранит тот же выбор и данные.'}`);
+    } finally { setPublishBusy(false); }
+  }
+
+  const selectSavedRoute = (route: Section) => { setSelectedRouteId(route.id); setLayout('results'); };
+  const selectedRoute = routes.find((route) => route.id === selectedRouteId) ?? results?.route ?? null;
+
+  return <main className="route-planner">
+    <header className="rp-heading"><div><span className="eyebrow">ПЛАНИРОВАНИЕ · НАЗНАЧЕНИЕ · КОНТРОЛЬ</span><h1>Маршруты обследования</h1><p>Постройте дорожный маршрут и назначьте его инспектору.</p></div><button className="button secondary rp-refresh" aria-label="Обновить маршруты" onClick={() => void loadPage(true)} disabled={refreshing}><RefreshCw size={16} className={refreshing ? 'rp-spin' : ''}/><span>Обновить</span></button></header>
+    {routesError && <div className="alert error" role="alert">{routesError}<button className="rp-alert-close" aria-label="Скрыть сообщение" onClick={() => setRoutesError('')}><X size={15}/></button></div>}
+    {publishSuccess && <div className="alert success" role="status"><Check size={16}/>{publishSuccess}<button className="rp-alert-close" aria-label="Скрыть сообщение" onClick={() => setPublishSuccess('')}><X size={15}/></button></div>}
+    <div className="rp-summary-row"><SummaryCard label="Всего маршрутов" value={routes.length} tone="green"/><SummaryCard label="Назначены" value={routes.filter((route) => route.state === 'assigned').length} tone="blue"/><SummaryCard label="Осматриваются" value={routes.filter((route) => route.state === 'in_progress').length} tone="amber"/><SummaryCard label="Завершены" value={routes.filter((route) => route.state === 'completed').length} tone="slate"/></div>
+    <nav className="rp-mobile-tabs" aria-label="Раздел маршрутов"><button className={layout === 'plan' ? 'active' : ''} onClick={() => setLayout('plan')}>Новый маршрут</button><button className={layout === 'routes' ? 'active' : ''} onClick={() => setLayout('routes')}>Список <span>{routes.length}</span></button><button className={layout === 'results' ? 'active' : ''} onClick={() => setLayout('results')}>Результаты</button></nav>
+    <div className={`rp-layout rp-layout-${layout}`}>
+      <section className="rp-plan-column">
+        <div className="rp-map-card">
+          <div className="rp-map-head"><div><span className="section-label">ТОЧКИ МАРШРУТА</span><strong>Выберите начало и конец поездки</strong><small>Щёлкните карту или задайте широту и долготу вручную.</small></div><span className="rp-map-icon"><RouteIcon size={19}/></span></div>
+          <div className="rp-point-pickers"><button className={`rp-point-picker ${pointMode === 'start' ? 'active' : ''} ${start ? 'complete' : ''}`} onClick={() => setPointMode('start')} disabled={publishBusy || !!pendingPublish}><i className="rp-start-dot">A</i><span><small>НАЧАЛО</small><strong>{pointLabel(start)}</strong></span></button><ArrowDownRight className="rp-point-arrow" size={17}/><button className={`rp-point-picker ${pointMode === 'end' ? 'active' : ''} ${end ? 'complete' : ''}`} onClick={() => setPointMode('end')} disabled={publishBusy || !!pendingPublish}><i className="rp-end-dot">B</i><span><small>КОНЕЦ</small><strong>{pointLabel(end)}</strong></span></button><button className="rp-clear-points" onClick={() => { setStart(null); setEnd(null); setStartLatInput(''); setStartLngInput(''); setEndLatInput(''); setEndLngInput(''); setPointMode('start'); setPointError(''); resetPreview(); }} disabled={(!start && !end) || publishBusy || !!pendingPublish} aria-label="Очистить точки"><X size={16}/></button></div>
+          <details className="rp-coordinate-entry"><summary>Ввести координаты вручную</summary><div className="rp-coordinate-fields"><CoordinateForm name="Начало" lat={startLatInput} lng={startLngInput} setLat={setStartLatInput} setLng={setStartLngInput} onApply={() => applyManualPoint('start')} disabled={publishBusy || !!pendingPublish}/><CoordinateForm name="Конец" lat={endLatInput} lng={endLngInput} setLat={setEndLatInput} setLng={setEndLngInput} onApply={() => applyManualPoint('end')} disabled={publishBusy || !!pendingPublish}/></div>{pointError && <div className="rp-coordinate-error" role="alert">{pointError}</div>}</details>
+          {!deviceLocation.position ? <div className={`rp-location-status ${deviceLocation.error ? 'failed' : ''}`} role="status" aria-live="polite"><MapPin size={15}/><span>{deviceLocation.error ? `Местоположение не получено. ${deviceLocation.error}` : 'Определяем ваше местоположение…'} Пока показан обзор области.</span>{deviceLocation.error && <button type="button" onClick={deviceLocation.retry}>Повторить</button>}</div> : <div className="rp-location-status ready" role="status"><MapPin size={15}/><span>Моё местоположение · точность около {Math.round(deviceLocation.position.accuracy_m)} м</span></div>}
+          <div className="rp-map-frame"><PlannerMap start={preview?.start ?? start} end={preview?.end ?? end} options={displayedOptions} selectedOptionId={selectedOptionId} decisionPoints={preview?.decision_points ?? []} location={deviceLocation.position} locationReady={deviceLocation.ready} hasEndpoints={!!start || !!end} mapInteracted={mapInteracted} onMapClick={handleMapClick} onSelectOption={setSelectedOptionId} loading={previewLoading} locked={publishBusy || !!pendingPublish}/></div>
+          <div className="rp-map-legend"><span><i className="rp-legend-point"/>Точка A</span><span><i className="rp-legend-point end"/>Точка B</span>{preview?.decision_points.length ? <span><i className="rp-legend-junction"/>Развилка вариантов</span> : null}<span className="rp-map-help">{pointMode === 'start' ? 'Выбрано начало' : 'Выбран конец'}</span></div>
+          {snappedDistance > 5 && <div className="rp-snap-note"><MapPin size={14}/>Точки привязаны к ближайшей дороге. В полях выше остаются указанные координаты.</div>}
+        </div>
+        <section className="rp-options-card">
+          <div className="rp-section-heading"><div><span className="section-label">ВАРИАНТЫ ДОРОГИ</span><h2>{previewLoading ? 'Строим маршруты…' : preview?.options.length === 1 ? 'Найден один вариант' : preview?.options.length ? 'Выберите вариант маршрута' : 'Предпросмотр маршрута'}</h2></div>{previewLoading && <span className="rp-loader" aria-label="Загрузка"/>}</div>
+          {previewError && <div className="alert error rp-inline-alert" role="alert"><AlertTriangle size={15}/><span>{previewError}</span><button className="button secondary small" onClick={() => setPreviewRevision((revision) => revision + 1)} disabled={!start || !end || previewLoading}>Повторить</button></div>}
+          {!start || !end ? <div className="rp-options-empty"><MapPin size={20}/><div><strong>Укажите две точки</strong><span>Поставьте A и B на карте, чтобы найти проезды по дороге.</span></div></div> : previewLoading ? <div className="rp-options-empty"><span className="rp-loader"/><div><strong>Запрашиваем дорожные варианты</strong><span>Сверяем точки с дорожной сетью.</span></div></div> : preview?.options.length ? <div className="rp-option-list">{preview.options.map((option, index) => <RouteOptionCard key={option.id} option={option} index={index} selected={selectedOptionId === option.id} multi={preview.options.length > 1} onSelect={() => setSelectedOptionId(option.id)} disabled={publishBusy || !!pendingPublish}/>)}</div> : !previewError && <div className="rp-options-empty"><RouteIcon size={20}/><div><strong>Варианты появятся здесь</strong><span>Выберите начало и конец поездки — сервис покажет проезды по дорожной сети.</span></div></div>}
+          {preview && <div className="rp-provider"><span>Провайдер: {preview.provider}</span><span>Предпросмотр до {formatDate(preview.expires_at)}</span></div>}
+        </section>
+        <section className="rp-assignment-card">
+          <div className="rp-section-heading"><div><span className="section-label">НАЗНАЧЕНИЕ</span><h2>Назначить инспектору</h2></div><span className="rp-step-number">03</span></div>
+          <label className="field">Название маршрута<input className="input" value={name} onChange={(e) => setName(e.target.value)} maxLength={90} placeholder="Например, Северный выезд — мост" disabled={!!pendingPublish || publishBusy}/></label>
+          <label className="field">Инспектор<select className="select" value={inspectorId} onChange={(e) => setInspectorId(e.target.value)} disabled={!!pendingPublish || publishBusy}><option value="">Выберите инспектора</option>{inspectors.map((inspector) => <option value={inspector.id} key={inspector.id}>{inspector.name}</option>)}</select></label>
+          <label className="field">Примечание <span className="rp-optional">необязательно</span><textarea className="textarea" value={notes} onChange={(e) => setNotes(e.target.value)} maxLength={500} placeholder="Особенности участка, точка встречи, ограничения…" disabled={!!pendingPublish || publishBusy}/></label>
+          {preview && preview.options.length > 1 && !selectedOptionId && <div className="rp-pick-warning"><AlertTriangle size={16}/>Сначала выберите один из {preview.options.length} вариантов маршрута.</div>}
+          {pendingPublish && <div className="rp-retry-note">Сервер не подтвердил результат. Повтор отправит те же данные и выбранный вариант, чтобы не создать дубликат.</div>}
+          {publishError && <div className="alert error rp-inline-alert" role="alert">{publishError}</div>}
+          <button className="button primary rp-publish" disabled={publishBusy || previewLoading || !preview || !selectedOptionId || !inspectorId || !name.trim()} onClick={() => void publish()}>{publishBusy ? 'Сохраняем маршрут…' : pendingPublish ? 'Повторить сохранение' : 'Сохранить маршрут и назначить'}<ArrowRight size={17}/></button>
+          {pendingPublish && <button className="rp-reset-attempt" disabled={publishBusy} onClick={resetPreview}>Сбросить попытку и построить новые варианты</button>}
+        </section>
+      </section>
+      <section className="rp-routes-column">
+        <div className="rp-route-list-card"><div className="rp-section-heading"><div><span className="section-label">НАЗНАЧЕННЫЕ МАРШРУТЫ</span><h2>Рабочий список</h2></div><button className="rp-icon-action" aria-label="Обновить список маршрутов" onClick={() => void loadPage(true)} disabled={refreshing}><RefreshCw size={15}/></button></div>
+          <div className="rp-route-filters"><label className="rp-search"><span>⌕</span><input value={routeSearch} onChange={(e) => setRouteSearch(e.target.value)} placeholder="Название, код, инспектор" aria-label="Поиск маршрутов"/></label><select className="select" value={routeStateFilter} onChange={(e) => setRouteStateFilter(e.target.value)} aria-label="Фильтр состояния"><option value="all">Все состояния</option><option value="assigned">Назначен</option><option value="in_progress">Осматривается</option><option value="completed">Завершён</option></select></div>
+          {initialLoading ? <div className="rp-list-empty"><span className="rp-loader"/>Загружаем маршруты…</div> : filteredRoutes.length === 0 ? <div className="rp-list-empty"><RouteIcon size={24}/><strong>{routes.length ? 'По фильтру ничего нет' : 'Маршруты ещё не назначены'}</strong><span>{routes.length ? 'Измените запрос или состояние.' : 'Постройте первый маршрут и выберите инспектора.'}</span></div> : <div className="rp-route-list">{filteredRoutes.map((route) => <button key={route.id} className={`rp-route-row ${selectedRouteId === route.id ? 'selected' : ''}`} onClick={() => selectSavedRoute(route)}><span className="rp-route-glyph"><RouteIcon size={17}/></span><span className="rp-route-row-main"><span className="rp-route-row-top"><strong>{route.name}</strong><span>{route.code}</span></span><span className="rp-route-row-meta"><span><UserRound size={12}/>{route.inspector_name}</span><span><Ruler size={12}/>{route.length_km.toLocaleString('ru-RU', { maximumFractionDigits: 1 })} км</span></span></span><span className={`rp-route-state ${route.state}`}>{routeState[route.state]}</span></button>)}</div>}
+        </div>
+        <div className="rp-results-card">
+          <div className="rp-section-heading"><div><span className="section-label">ПЛАН И ФАКТИЧЕСКИЙ ПУТЬ</span><h2>{selectedRoute?.name ?? 'Результаты маршрута'}</h2>{selectedRoute && <small>{selectedRoute.code} · {selectedRoute.inspector_name}</small>}</div>{selectedRoute && <span className={`rp-route-state ${selectedRoute.state}`}>{routeState[selectedRoute.state]}</span>}</div>
+          {!selectedRoute ? <div className="rp-list-empty"><MapPin size={23}/><strong>Выберите маршрут</strong><span>Здесь появится запланированная линия и GPS-путь инспектора.</span></div> : resultsLoading ? <div className="rp-list-empty"><span className="rp-loader"/>Загружаем результаты…</div> : resultsError ? <div className="alert error" role="alert">{resultsError}<button className="button secondary small" onClick={() => setResultsRevision((revision) => revision + 1)}>Повторить</button></div> : results ? <>
+            {results.inspections.length > 0 && <div className="rp-inspections"><span className="section-label">ОСМОТРЫ</span><div className="rp-inspection-picks">{results.inspections.map((inspection, index) => <button key={inspection.id} onClick={() => setSelectedInspectionId(inspection.id)} className={selectedInspectionId === inspection.id ? 'active' : ''}><span>{inspection.status === 'active' ? 'Идёт сейчас' : `Осмотр ${results.inspections.length - index}`}</span><small>{routeDate(inspection.started_at)}{inspection.finished_at ? ` — ${routeDate(inspection.finished_at)}` : ''}</small></button>)}</div></div>}
+            <div className="rp-results-map"><MapView section={results.route} defects={results.defects} track={selectedInspection?.points ?? []} height={380} locateOnOpen={false}/></div>
+            <div className="rp-results-legend"><span><i className="planned"/>Запланированный маршрут</span><span><i className="actual"/>Фактический GPS-путь</span><span><i className="defect"/>Дефекты ({results.defects.length})</span></div>
+            {results.inspections.length === 0 && <div className="rp-no-inspections"><Clock3 size={17}/><span>Инспектор ещё не начал осмотр. На карте показан только плановый маршрут.</span></div>}
+          </> : null}
+        </div>
+      </section>
+    </div>
+    {user.role !== 'dispatcher' && <div className="rp-role-note">Планирование маршрутов доступно диспетчеру.</div>}
+  </main>;
+}
+
+function SummaryCard({ label, value, tone }: { label: string; value: number; tone: string }) { return <div className={`rp-summary ${tone}`}><span>{label}</span><strong>{value}</strong><i/></div>; }
+
+function CoordinateForm({ name, lat, lng, setLat, setLng, onApply, disabled = false }: { name: string; lat: string; lng: string; setLat: (value: string) => void; setLng: (value: string) => void; onApply: () => void; disabled?: boolean }) {
+  return <div className="rp-coordinate-group"><span className="section-label">{name.toLocaleUpperCase('ru')}</span><label>Широта<input className="input" type="number" inputMode="decimal" step="any" min="-90" max="90" value={lat} onChange={(event) => setLat(event.target.value)} placeholder="44.850000" aria-label={`Широта: ${name.toLowerCase()}`} disabled={disabled}/></label><label>Долгота<input className="input" type="number" inputMode="decimal" step="any" min="-180" max="180" value={lng} onChange={(event) => setLng(event.target.value)} placeholder="65.520000" aria-label={`Долгота: ${name.toLowerCase()}`} disabled={disabled}/></label><button className="button secondary small" onClick={onApply} disabled={disabled || !lat.trim() || !lng.trim()}>Задать точку</button></div>;
+}
+
+function RouteOptionCard({ option, index, selected, multi, onSelect, disabled = false }: { option: RouteOption; index: number; selected: boolean; multi: boolean; onSelect: () => void; disabled?: boolean }) {
+  const color = ROUTE_COLORS[index % ROUTE_COLORS.length];
+  return <button className={`rp-option ${selected ? 'selected' : ''}`} style={{ '--route-color': color } as CSSProperties} onClick={onSelect} aria-pressed={selected} disabled={disabled}>
+    <span className="rp-option-index">{selected ? <Check size={16}/> : index + 1}</span><span className="rp-option-copy"><strong>{option.summary || `Вариант ${index + 1}`}</strong><span className="rp-option-metrics"><span><Ruler size={13}/>{meters(option.distance_m)}</span><span><Clock3 size={13}/>{minutes(option.duration_s)}</span></span>{multi && <small>{selected ? 'Вы выбрали этот маршрут' : 'Нажмите, чтобы сравнить на карте'}</small>}</span><span className="rp-option-line"/></button>;
+}
+
+type DevicePosition = { lat: number; lng: number; accuracy_m: number; recorded_at: string };
+function PlannerMap({ start, end, options, selectedOptionId, decisionPoints, location, locationReady, hasEndpoints, mapInteracted, onMapClick, onSelectOption, loading, locked }: { start: RoutePoint | null; end: RoutePoint | null; options: RouteOption[]; selectedOptionId: string | null; decisionPoints: RoutePreview['decision_points']; location: DevicePosition | null; locationReady: boolean; hasEndpoints: boolean; mapInteracted: MutableRefObject<boolean>; onMapClick: (lat: number, lng: number) => void; onSelectOption: (id: string) => void; loading: boolean; locked: boolean }) {
+  const [tileError, setTileError] = useState(false);
+  const mapRef = useRef<L.Map | null>(null);
+  return <div className={`rp-leaflet ${loading ? 'loading' : ''}`}><MapContainer center={DEFAULT_CENTER} zoom={5} scrollWheelZoom touchZoom zoomAnimation={false} fadeAnimation={false} markerZoomAnimation={false} style={{ height: '100%', width: '100%' }}><PlannerMapBehavior mapRef={mapRef} start={start} end={end} options={options} selectedOptionId={selectedOptionId} location={location} locationReady={locationReady} hasEndpoints={hasEndpoints} mapInteracted={mapInteracted} onMapClick={onMapClick}/><TileLayer url="https://tile.openstreetmap.org/{z}/{x}/{y}.png" attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' eventHandlers={{ tileerror: () => setTileError(true) }}/>
+    {options.map((option, index) => (
+      <Polyline key={option.id} positions={fromCoordinates(option.geometry.coordinates)} bubblingMouseEvents={false} pathOptions={{ color: ROUTE_COLORS[index % ROUTE_COLORS.length], weight: option.id === selectedOptionId ? 8 : selectedOptionId ? 4 : 5, opacity: selectedOptionId && option.id !== selectedOptionId ? .36 : .9 }} eventHandlers={{ click: () => { if (!locked) onSelectOption(option.id); } }} />
+    ))}
+    {decisionPoints.map((point, index) => <Marker key={`${point.lat}-${point.lng}-${index}`} position={toLatLng(point)} icon={L.divIcon({ className: 'rp-map-div-icon', html: `<span class="rp-divergence-marker">${index + 1}</span>`, iconSize: [28, 28], iconAnchor: [14, 14] })}><Popup><strong>Развилка {index + 1}</strong><br/>{point.label}</Popup></Marker>)}
+    {location && <Marker position={[location.lat, location.lng]} icon={L.divIcon({ className: 'rp-map-div-icon', html: '<span class="rp-device-location"><i></i></span>', iconSize: [30, 30], iconAnchor: [15, 15] })} zIndexOffset={1000}><Popup><strong>Моё местоположение</strong><br/>Точность около {Math.round(location.accuracy_m)} м<br/>{formatDate(location.recorded_at)}</Popup></Marker>}
+    {start && <Marker position={toLatLng(start)} icon={L.divIcon({ className: 'rp-map-div-icon', html: '<span class="rp-endpoint start">A</span>', iconSize: [34, 34], iconAnchor: [17, 17] })}><Popup>Начало · {pointLabel(start)}</Popup></Marker>}{end && <Marker position={toLatLng(end)} icon={L.divIcon({ className: 'rp-map-div-icon', html: '<span class="rp-endpoint end">B</span>', iconSize: [34, 34], iconAnchor: [17, 17] })}><Popup>Конец · {pointLabel(end)}</Popup></Marker>}
+  </MapContainer>{locationReady && location && <button type="button" className="rp-locate-button" ref={(node) => { if (node) L.DomEvent.disableClickPropagation(node); }} onClick={() => mapRef.current?.setView([location.lat, location.lng], 15, { animate: false })}><LocateFixed size={15}/>Моё местоположение</button>}{tileError && <div className="rp-tile-error">Картографическая подложка недоступна. Линии маршрута сохранены.</div>}</div>;
+}
+
+function PlannerMapBehavior({ mapRef, start, end, options, selectedOptionId, location, locationReady, hasEndpoints, mapInteracted, onMapClick }: { mapRef: MutableRefObject<L.Map | null>; start: RoutePoint | null; end: RoutePoint | null; options: RouteOption[]; selectedOptionId: string | null; location: DevicePosition | null; locationReady: boolean; hasEndpoints: boolean; mapInteracted: MutableRefObject<boolean>; onMapClick: (lat: number, lng: number) => void }) {
+  const map = useMap();
+  mapRef.current = map;
+  const autoCenteredOnGps = useRef(false);
+  useMapEvents({ click: (event) => onMapClick(event.latlng.lat, event.latlng.lng), dragstart: () => { mapInteracted.current = true; }, zoomstart: () => { mapInteracted.current = true; } });
+  useEffect(() => {
+    const chosen = options.find((option) => option.id === selectedOptionId);
+    const coordinates = chosen?.geometry.coordinates ?? options.flatMap((option) => option.geometry.coordinates);
+    const latlngs: L.LatLngExpression[] = coordinates.map(([lng, lat]) => [lat, lng]);
+    if (start) latlngs.push(toLatLng(start));
+    if (end) latlngs.push(toLatLng(end));
+    if (latlngs.length) map.fitBounds(L.latLngBounds(latlngs), { padding: [32, 32], maxZoom: 14, animate: false });
+    else if (start && end) map.fitBounds(L.latLngBounds([toLatLng(start), toLatLng(end)]), { padding: [40, 40], maxZoom: 14, animate: false });
+    else if (start || end) map.setView(toLatLng((start ?? end)!), 13, { animate: false });
+  }, [map, start?.lat, start?.lng, end?.lat, end?.lng, options, selectedOptionId]);
+  useEffect(() => {
+    if (!locationReady || !location || autoCenteredOnGps.current) return;
+    autoCenteredOnGps.current = true;
+    if (!hasEndpoints && !mapInteracted.current) map.setView([location.lat, location.lng], 15, { animate: false });
+  }, [map, locationReady, location?.lat, location?.lng, hasEndpoints, mapInteracted]);
+  useEffect(() => {
+    const resizeObserver = new ResizeObserver(() => map.invalidateSize());
+    resizeObserver.observe(map.getContainer());
+    return () => resizeObserver.disconnect();
+  }, [map]);
+  return null;
+}

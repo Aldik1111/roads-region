@@ -8,3 +8,20 @@
 .map-hint,.map-warning{left:54px}.history-change{display:block;overflow-wrap:anywhere;margin-top:5px}
 
 @media(min-width:761px) and (max-width:1000px){.desktop-sidebar{display:none}.mobile-brand{display:flex;gap:8px;align-items:center;font-size:15px;font-weight:800}.breadcrumb{display:none}}
+
+.sidebar-navigation{display:grid;gap:7px}
+.sidebar-nav-item{display:flex;align-items:center;gap:12px;min-height:48px;padding:12px 14px;border:1px solid transparent;border-radius:11px;background:transparent;color:#b7cbc1;text-align:left;font-size:13px;font-weight:700}
+.sidebar-nav-item.active{background:#304a3e;border-color:#486355;color:#fff}
+.sidebar-nav-item:hover{background:#294638}
+.workspace-tabs{display:flex;gap:6px;margin-bottom:25px;border-bottom:1px solid var(--line);padding-bottom:12px}
+.workspace-tabs button{display:flex;align-items:center;justify-content:center;gap:9px;border:1px solid transparent;border-radius:9px;background:transparent;padding:12px 20px;font-size:13px;font-weight:800;color:#63786c;min-height:44px}
+.workspace-tabs button.active{color:var(--teal);background:#e4eee5;border-color:#cddfcf}
+.route-endpoint{display:grid;place-items:center;width:26px;height:26px;border:2px solid white;border-radius:50%;color:white;background:#126e60;font-weight:800;box-shadow:0 1px 5px #12372d55}
+.route-endpoint.finish{background:#435074}
+.legend-line.planned{border-color:#6976a0}
+.map-locate-button{position:absolute;right:12px;top:12px;z-index:1000;display:grid;place-items:center;width:44px;height:44px;border:1px solid #bfd0c9;border-radius:10px;background:white;color:#126e60;box-shadow:0 2px 7px #173e3026;cursor:pointer}
+.device-location-dot{display:block;width:20px;height:20px;margin:2px;border:3px solid #fff;border-radius:50%;background:#287de0;box-shadow:0 0 0 6px #287de02c,0 1px 5px #14283f66}
+.selected-location-pin{display:block;position:relative;width:28px;height:28px;margin:3px 2px;background:#d47b31;border:3px solid white;border-radius:50% 50% 50% 0;transform:rotate(-45deg);box-shadow:0 2px 5px #4a2e1966}
+.selected-location-pin:after{content:'';position:absolute;inset:7px;border-radius:50%;background:white}
+.map-location-status{position:absolute;left:54px;right:64px;top:12px;z-index:500;padding:8px 10px;border-radius:8px;background:#ffffffed;color:#41645a;font-size:11px;box-shadow:0 1px 4px #15382b20;pointer-events:none}
+@media(max-width:760px){.workspace-tabs{margin-bottom:20px}.workspace-tabs button{flex:1;padding:10px 14px}.map-caption{font-size:9px;gap:5px}}

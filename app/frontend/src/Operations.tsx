@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { api, ApiError } from './api';
 import { History, MapView, PhotoGallery, StatusBadge, formatDate, UploadField } from './components';
-import type { Contractor, Defect, DefectDetail, Section, User } from './types';
+import type { Bootstrap, Contractor, Defect, DefectDetail, Section, User } from './types';
 import './operations.css';
 
 type Props = { user: User };
@@ -22,6 +22,7 @@ const utcValue = (value: string) => new Date(value).toISOString();
 const dateInThreeDays = () => localInput(new Date(Date.now() + 3 * 86400000).toISOString());
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Не удалось выполнить запрос. Попробуйте ещё раз.';
 const statusCaption: Record<string, string> = { new: 'Новые', needs_info: 'Нужны сведения', assigned: 'Назначены', accepted: 'Приняты', in_progress: 'В работе', review: 'На проверке', rework: 'На доработке', closed: 'Закрыты', cancelled: 'Отменены' };
+const routeLabel = (section?: Section | null) => section ? `${section.code} · ${section.name}` : 'Маршрут не найден';
 
 export default function Operations({ user }: Props) {
   return user.role === 'contractor' ? <ContractorWorkspace user={user} /> : <DispatcherWorkspace user={user} />;
@@ -30,6 +31,7 @@ export default function Operations({ user }: Props) {
 function DispatcherWorkspace({ user }: Props) {
   const [defects, setDefects] = useState<Defect[]>([]);
   const [sections, setSections] = useState<Section[]>([]);
+  const [routeFilter, setRouteFilter] = useState('all');
   const [contractors, setContractors] = useState<Contractor[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<DefectDetail | null>(null);
@@ -48,7 +50,7 @@ function DispatcherWorkspace({ user }: Props) {
     setLoading(true);
     if (!keepNotice) setNotice(null);
     try {
-      const [rows, boot] = await Promise.all([api.get<Defect[]>('/defects'), api.get<{ sections: Section[]; contractors: Contractor[] }>('/bootstrap')]);
+      const [rows, boot] = await Promise.all([api.get<Defect[]>('/defects'), api.get<Bootstrap>('/bootstrap')]);
       setDefects(rows.sort(byFreshness));
       setSections(boot.sections);
       setContractors(boot.contractors);
@@ -74,11 +76,13 @@ function DispatcherWorkspace({ user }: Props) {
 
   const visible = useMemo(() => defects.filter((d) => {
     const needle = search.trim().toLocaleLowerCase('ru');
-    const matchesText = !needle || `${d.number} ${d.type} ${d.description} ${d.contractor_name ?? ''}`.toLocaleLowerCase('ru').includes(needle);
-    return matchesText && (filter === 'all' || (filter === 'active' ? ACTIVE.includes(d.status) : d.status === filter)) && (!overdueOnly || d.overdue);
-  }), [defects, search, filter, overdueOnly]);
+    const section = sections.find((item) => item.id === d.section_id);
+    const matchesText = !needle || `${d.number} ${d.type} ${d.description} ${d.contractor_name ?? ''} ${section?.name ?? ''} ${section?.code ?? ''}`.toLocaleLowerCase('ru').includes(needle);
+    return matchesText && (routeFilter === 'all' || d.section_id === routeFilter) && (filter === 'all' || (filter === 'active' ? ACTIVE.includes(d.status) : d.status === filter)) && (!overdueOnly || d.overdue);
+  }), [defects, sections, search, filter, overdueOnly, routeFilter]);
+  useEffect(() => { if (selectedId && !visible.some((item) => item.id === selectedId)) setSelectedId(visible[0]?.id ?? null); }, [selectedId, visible]);
   const summary = useMemo(() => ({ active: defects.filter((d) => ACTIVE.includes(d.status)).length, overdue: defects.filter((d) => d.overdue).length, review: defects.filter((d) => d.status === 'review').length, closed: defects.filter((d) => d.status === 'closed').length }), [defects]);
-  const selectedSection = sections.find((s) => s.id === detail?.section_id) ?? sections[0];
+  const selectedSection = routeFilter === 'all' ? undefined : sections.find((section) => section.id === routeFilter);
 
   async function mutate(action: string, payload: Record<string, unknown>) {
     if (!detail) return;
@@ -99,7 +103,7 @@ function DispatcherWorkspace({ user }: Props) {
   const selectTicket = (id: string) => { setSelectedId(id); setPanel('detail'); };
   return <main className="ops-shell">
     <header className="ops-heading">
-      <div><div className="eyebrow">ДИСПЕТЧЕРСКАЯ · R-01</div><h1>Дефекты участка</h1><p>Здравствуйте, {user.name}. Управляйте назначениями и сроками.</p></div>
+      <div><div className="eyebrow">ДИСПЕТЧЕРСКАЯ · РЕЕСТР</div><h1>Дефекты участков</h1><p>Здравствуйте, {user.name}. Управляйте назначениями и сроками.</p></div>
       <button className="button secondary ops-refresh" onClick={() => void refresh()} disabled={loading}>↻ <span>Обновить</span></button>
     </header>
     {notice && <div className={`alert ${notice.kind}`} role="status">{notice.text}<button className="ops-notice-close" aria-label="Скрыть сообщение" onClick={() => setNotice(null)}>×</button></div>}
@@ -117,14 +121,15 @@ function DispatcherWorkspace({ user }: Props) {
         <div className="ops-list-head"><div><div className="section-label">ЖУРНАЛ</div><strong>{visible.length} обращений</strong></div><span className="ops-live-dot">Актуально</span></div>
         <label className="ops-search"><span aria-hidden="true">⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Номер, дефект, исполнитель" aria-label="Поиск по обращениям" /></label>
         <div className="ops-list-filters"><select className="select" aria-label="Фильтр по статусу" value={filter} onChange={(e) => setFilter(e.target.value)}><option value="active">Активные статусы</option><option value="all">Все статусы</option>{Object.entries(statusCaption).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select><button className={`ops-overdue-toggle ${overdueOnly ? 'active' : ''}`} onClick={() => setOverdueOnly((v) => !v)} aria-pressed={overdueOnly}>Срок истёк</button></div>
+        <label className="ops-route-filter"><span>Участок</span><select className="select" aria-label="Фильтр по маршруту" value={routeFilter} onChange={(e) => setRouteFilter(e.target.value)}><option value="all">Все маршруты</option>{sections.map((section) => <option key={section.id} value={section.id}>{routeLabel(section)}</option>)}</select></label>
         <div className="ops-ticket-list" aria-live="polite">
           {loading ? <div className="empty"><span className="ops-spinner" />Загружаем обращения…</div> : visible.length === 0 ? <div className="empty"><span className="ops-empty-mark">⌕</span><strong>Ничего не найдено</strong><span>Измените фильтр или поисковый запрос.</span></div> : visible.map((ticket) => <button key={ticket.id} className={`ops-ticket ${ticket.id === selectedId ? 'selected' : ''}`} onClick={() => selectTicket(ticket.id)}>
-            <div className="ops-ticket-top"><span className="ops-number">№ {ticket.number}</span><StatusBadge status={ticket.status} overdue={ticket.overdue} /></div><strong className="ops-ticket-title">{ticket.type}</strong><span className="ops-ticket-description">{ticket.description}</span><div className="ops-ticket-meta"><span>{formatDate(ticket.received_at)}</span><span>{ticket.contractor_name ?? 'Исполнитель не назначен'}</span></div>
+            <div className="ops-ticket-top"><span className="ops-number">№ {ticket.number}</span><StatusBadge status={ticket.status} overdue={ticket.overdue} /></div><strong className="ops-ticket-title">{ticket.type}</strong><span className="ops-ticket-description">{ticket.description}</span><div className="ops-ticket-meta"><span>{formatDate(ticket.received_at)}</span><span>{routeLabel(sections.find((section) => section.id === ticket.section_id))}</span></div>
           </button>)}
         </div>
       </aside>
-      <section className="ops-map card"><div className="ops-map-head"><div><div className="section-label">СХЕМА УЧАСТКА</div><strong>R-01 · Кызылординская область</strong></div><span className="ops-map-key"><i /> Дефекты</span></div><MapView section={selectedSection} defects={visible} selectedId={selectedId ?? undefined} onSelect={selectTicket} height={452} /><div className="ops-map-foot"><span>Линия участка и зарегистрированные дефекты</span><span>{visible.length} на карте</span></div></section>
-      <section className="ops-detail card">{detailLoading && !detail ? <div className="empty"><span className="ops-spinner" />Открываем карточку…</div> : detail ? <DispatcherDetail detail={detail} contractors={contractors} onAction={mutate} onOpenDialog={(kind, contractorId, dueAt) => setDialog({ kind, contractorId, dueAt })} busy={actionBusy} /> : <div className="empty"><span className="ops-empty-mark">◫</span><strong>Выберите обращение</strong><span>Карточка покажет фотографии, место и историю проверки.</span></div>}</section>
+      <section className="ops-map card"><div className="ops-map-head"><div><div className="section-label">ПЛАН И МЕСТА ДЕФЕКТОВ</div><strong>{selectedSection ? routeLabel(selectedSection) : routeFilter === 'all' ? 'Все назначенные маршруты' : 'Маршрут'}</strong></div><span className="ops-map-key"><i /> Дефекты</span></div><MapView section={selectedSection} defects={visible} selectedId={selectedId ?? undefined} onSelect={selectTicket} height={452} /><div className="ops-map-foot"><span>Плановая линия маршрута и зарегистрированные дефекты</span><span>{visible.length} на карте</span></div></section>
+      <section className="ops-detail card">{detailLoading && !detail ? <div className="empty"><span className="ops-spinner" />Открываем карточку…</div> : detail ? <DispatcherDetail detail={detail} section={sections.find((item) => item.id === detail.section_id)} contractors={contractors} onAction={mutate} onOpenDialog={(kind, contractorId, dueAt) => setDialog({ kind, contractorId, dueAt })} busy={actionBusy} /> : <div className="empty"><span className="ops-empty-mark">◫</span><strong>Выберите обращение</strong><span>Карточка покажет фотографии, место и историю проверки.</span></div>}</section>
     </section>
     {dialog && detail && <DispatcherDialog kind={dialog.kind} detail={detail} contractors={contractors} initialContractorId={dialog.contractorId} initialDueAt={dialog.dueAt} busy={actionBusy} onClose={() => setDialog(null)} onSubmit={mutate} />}
   </main>;
@@ -132,14 +137,14 @@ function DispatcherWorkspace({ user }: Props) {
 
 function Summary({ label, value, tint, onClick }: { label: string; value: number; tint: string; onClick: () => void }) { return <button className={`ops-summary ${tint}`} onClick={onClick}><span>{label}</span><strong>{value}</strong><i>↗</i></button>; }
 
-function DispatcherDetail({ detail, contractors, onAction, onOpenDialog, busy }: { detail: DefectDetail; contractors: Contractor[]; onAction: (action: string, payload: Record<string, unknown>) => Promise<void>; onOpenDialog: (kind: DispatcherDialogKind, contractorId?: string, dueAt?: string) => void; busy: boolean }) {
+function DispatcherDetail({ detail, section, contractors, onAction, onOpenDialog, busy }: { detail: DefectDetail; section?: Section; contractors: Contractor[]; onAction: (action: string, payload: Record<string, unknown>) => Promise<void>; onOpenDialog: (kind: DispatcherDialogKind, contractorId?: string, dueAt?: string) => void; busy: boolean }) {
   const [contractorId, setContractorId] = useState(detail.contractor_id ?? '');
   const [dueAt, setDueAt] = useState(localInput(detail.due_at) || dateInThreeDays());
   useEffect(() => { setContractorId(detail.contractor_id ?? ''); setDueAt(localInput(detail.due_at) || dateInThreeDays()); }, [detail.id, detail.contractor_id, detail.due_at]);
   return <>
     <div className="ops-detail-header"><div><div className="section-label">КАРТОЧКА ОБРАЩЕНИЯ</div><div className="ops-detail-number">№ {detail.number}</div></div><StatusBadge status={detail.status} overdue={detail.overdue} /></div>
     <h2 className="ops-defect-title">{detail.type}</h2><p className="ops-defect-description">{detail.description}</p>
-    <div className="ops-facts"><Fact label="Участок" value="R-01 · Кызылорда" /><Fact label="Обнаружено" value={formatDate(detail.observed_at)} /><Fact label="Получено" value={formatDate(detail.received_at)} /><Fact label="Исполнитель" value={detail.contractor_name ?? 'Не назначен'} /><Fact label="Срок" value={detail.due_at ? formatDate(detail.due_at) : 'Не установлен'} /></div>
+    <div className="ops-facts"><Fact label="Маршрут" value={routeLabel(section)} /><Fact label="Обнаружено" value={formatDate(detail.observed_at)} /><Fact label="Получено" value={formatDate(detail.received_at)} /><Fact label="Исполнитель" value={detail.contractor_name ?? 'Не назначен'} /><Fact label="Срок" value={detail.due_at ? formatDate(detail.due_at) : 'Не установлен'} /></div>
     <div className="ops-coordinate"><div><span className="section-label">КООРДИНАТЫ</span><strong>{detail.lat.toFixed(6)}°, {detail.lng.toFixed(6)}°</strong><span>{detail.location_source === 'gps' ? 'GPS' : 'Указано вручную'}{detail.accuracy_m != null ? ` · точность ±${Math.round(detail.accuracy_m)} м` : ''}</span></div><span className="ops-pin">⌖</span></div>
     <div className="ops-detail-section"><div className="section-label">ИСХОДНЫЕ ФОТОГРАФИИ <span>{detail.photos.length}</span></div><PhotoGallery photos={detail.photos} /></div>
     {detail.repairs.length > 0 && <div className="ops-detail-section"><div className="section-label">ПОПЫТКИ РЕМОНТА <span>{detail.repairs.length}</span></div><div className="ops-repairs">{detail.repairs.map((repair, i) => <article key={repair.id} className="ops-repair"><div className="ops-repair-title"><strong>Попытка {i + 1}</strong><span>{formatDate(repair.created_at)}</span></div><p>{repair.comment}</p><PhotoGallery photos={repair.photos} />{repair.decision && <div className={`ops-decision ${repair.decision}`}>{repair.decision === 'accepted' ? 'Работа принята' : `Возвращено на доработку${repair.decision_comment ? `: ${repair.decision_comment}` : ''}`}</div>}</article>)}</div></div>}
@@ -170,8 +175,10 @@ function DispatcherDialog({ kind, detail, contractors, initialContractorId, init
 
 function ContractorWorkspace({ user }: Props) {
   const [defects, setDefects] = useState<Defect[]>([]);
+  const [sections, setSections] = useState<Section[]>([]);
   const [detail, setDetail] = useState<DefectDetail | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [routeFilter, setRouteFilter] = useState('all');
   const [photos, setPhotos] = useState<DefectDetail['photos']>([]);
   const [comment, setComment] = useState('');
   const [reportReason, setReportReason] = useState('');
@@ -182,11 +189,15 @@ function ContractorWorkspace({ user }: Props) {
   const [notice, setNotice] = useState<Notice>(null);
   const [panel, setPanel] = useState<Panel>('list');
   const [search, setSearch] = useState('');
-  const refresh = useCallback(async (keepNotice = false) => { setLoading(true); if (!keepNotice) setNotice(null); try { const rows = await api.get<Defect[]>('/defects'); setDefects(rows.sort(byFreshness)); setSelectedId((cur) => cur && rows.some((d) => d.id === cur) ? cur : rows[0]?.id ?? null); } catch (e) { setNotice({ kind: 'error', text: errorText(e) }); } finally { setLoading(false); } }, []);
+  const refresh = useCallback(async (keepNotice = false) => { setLoading(true); if (!keepNotice) setNotice(null); try { const [rows, boot] = await Promise.all([api.get<Defect[]>('/defects'), api.get<Bootstrap>('/bootstrap')]); setDefects(rows.sort(byFreshness)); setSections(boot.sections); setSelectedId((cur) => cur && rows.some((d) => d.id === cur) ? cur : rows[0]?.id ?? null); } catch (e) { setNotice({ kind: 'error', text: errorText(e) }); } finally { setLoading(false); } }, []);
   const loadDetail = useCallback(async (id: string) => { setDetailLoading(true); try { const value = await api.get<DefectDetail>(`/defects/${id}`); setDetail(value); setPhotos([]); setComment(''); } catch (e) { setNotice({ kind: 'error', text: errorText(e) }); } finally { setDetailLoading(false); } }, []);
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { setDetail(null); if (selectedId) void loadDetail(selectedId); }, [selectedId, loadDetail]);
-  const visible = useMemo(() => defects.filter((d) => `${d.number} ${d.type} ${d.description}`.toLocaleLowerCase('ru').includes(search.toLocaleLowerCase('ru'))), [defects, search]);
+  const visible = useMemo(() => defects.filter((d) => {
+    const section = sections.find((item) => item.id === d.section_id);
+    return (routeFilter === 'all' || d.section_id === routeFilter) && `${d.number} ${d.type} ${d.description} ${section?.name ?? ''} ${section?.code ?? ''}`.toLocaleLowerCase('ru').includes(search.toLocaleLowerCase('ru'));
+  }), [defects, sections, search, routeFilter]);
+  useEffect(() => { if (selectedId && !visible.some((item) => item.id === selectedId)) setSelectedId(visible[0]?.id ?? null); }, [selectedId, visible]);
   async function action(name: string, payload: Record<string, unknown> = {}) {
     if (!detail) return; setBusy(true); setNotice(null);
     try { const updated = await api.post<DefectDetail>(`/defects/${detail.id}/actions`, { action: name, version: detail.version, payload }); setDetail(updated); setDefects((list) => list.map((row) => row.id === updated.id ? { ...row, ...updated } : row)); setPhotos([]); setComment(''); setNotice({ kind: 'success', text: 'Статус обращения обновлён.' }); await refresh(true); await loadDetail(updated.id); }
@@ -198,10 +209,10 @@ function ContractorWorkspace({ user }: Props) {
     {notice && <div className={`alert ${notice.kind}`} role="status">{notice.text}<button className="ops-notice-close" aria-label="Скрыть сообщение" onClick={() => setNotice(null)}>×</button></div>}
     <div className="ops-tabs"><button className={`tab ${panel === 'list' ? 'active' : ''}`} onClick={() => setPanel('list')}>Обращения</button><button className={`tab ${panel === 'detail' ? 'active' : ''}`} onClick={() => setPanel('detail')}>Карточка</button></div>
     <section className={`ops-contractor-layout ops-panel-${panel}`}>
-      <aside className="ops-list card"><div className="ops-list-head"><div><div className="section-label">НАЗНАЧЕНИЯ</div><strong>{visible.length} обращений</strong></div></div><label className="ops-search"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Номер или вид дефекта" aria-label="Поиск по обращениям" /></label><div className="ops-ticket-list">{loading ? <div className="empty"><span className="ops-spinner" />Загружаем назначения…</div> : visible.length === 0 ? <div className="empty"><span className="ops-empty-mark">✓</span><strong>Обращений пока нет</strong><span>Новые назначения появятся здесь.</span></div> : visible.map((ticket) => <button key={ticket.id} className={`ops-ticket ${ticket.id === selectedId ? 'selected' : ''}`} onClick={() => { setSelectedId(ticket.id); setPanel('detail'); }}><div className="ops-ticket-top"><span className="ops-number">№ {ticket.number}</span><StatusBadge status={ticket.status} overdue={ticket.overdue} /></div><strong className="ops-ticket-title">{ticket.type}</strong><span className="ops-ticket-description">{ticket.description}</span><div className="ops-ticket-meta"><span>{ticket.due_at ? `Срок ${formatDate(ticket.due_at)}` : 'Срок не установлен'}</span><span>Получено {formatDate(ticket.received_at)}</span></div></button>)}</div></aside>
+      <aside className="ops-list card"><div className="ops-list-head"><div><div className="section-label">НАЗНАЧЕНИЯ</div><strong>{visible.length} обращений</strong></div></div><label className="ops-search"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Номер или вид дефекта" aria-label="Поиск по обращениям" /></label><label className="ops-route-filter"><span>Маршрут</span><select className="select" aria-label="Фильтр по маршруту" value={routeFilter} onChange={(e) => setRouteFilter(e.target.value)}><option value="all">Все маршруты</option>{sections.map((section) => <option key={section.id} value={section.id}>{routeLabel(section)}</option>)}</select></label><div className="ops-ticket-list">{loading ? <div className="empty"><span className="ops-spinner" />Загружаем назначения…</div> : visible.length === 0 ? <div className="empty"><span className="ops-empty-mark">✓</span><strong>Обращений пока нет</strong><span>Новые назначения появятся здесь.</span></div> : visible.map((ticket) => <button key={ticket.id} className={`ops-ticket ${ticket.id === selectedId ? 'selected' : ''}`} onClick={() => { setSelectedId(ticket.id); setPanel('detail'); }}><div className="ops-ticket-top"><span className="ops-number">№ {ticket.number}</span><StatusBadge status={ticket.status} overdue={ticket.overdue} /></div><strong className="ops-ticket-title">{ticket.type}</strong><span className="ops-ticket-description">{ticket.description}</span><div className="ops-ticket-meta"><span>{routeLabel(sections.find((section) => section.id === ticket.section_id))}</span><span>{ticket.due_at ? `Срок ${formatDate(ticket.due_at)}` : 'Срок не установлен'}</span></div></button>)}</div></aside>
       <section className="ops-contractor-detail card">{detailLoading ? <div className="empty"><span className="ops-spinner" />Открываем карточку…</div> : detail ? <>
         <div className="ops-detail-header"><div><div className="section-label">НАЗНАЧЕНО ВАМ</div><div className="ops-detail-number">№ {detail.number}</div></div><StatusBadge status={detail.status} overdue={detail.overdue} /></div><h2 className="ops-defect-title">{detail.type}</h2><p className="ops-defect-description">{detail.description}</p>
-        <div className="ops-facts ops-facts-two"><Fact label="Участок" value="R-01 · Кызылорда" /><Fact label="Срок выполнения" value={detail.due_at ? formatDate(detail.due_at) : 'Не установлен'} /><Fact label="Обнаружено" value={formatDate(detail.observed_at)} /></div>
+        <div className="ops-facts ops-facts-two"><Fact label="Маршрут" value={routeLabel(sections.find((section) => section.id === detail.section_id))} /><Fact label="Срок выполнения" value={detail.due_at ? formatDate(detail.due_at) : 'Не установлен'} /><Fact label="Обнаружено" value={formatDate(detail.observed_at)} /></div>
         <div className="ops-coordinate"><div><span className="section-label">МЕСТО РЕМОНТА</span><strong>{detail.lat.toFixed(6)}°, {detail.lng.toFixed(6)}°</strong><span>{detail.location_source === 'gps' ? 'Координаты GPS' : 'Координаты указаны вручную'}{detail.accuracy_m != null ? ` · точность ±${Math.round(detail.accuracy_m)} м` : ''}</span></div><span className="ops-pin">⌖</span></div>
         <div className="ops-detail-section"><div className="section-label">ИСХОДНЫЕ ФОТОГРАФИИ</div><PhotoGallery photos={detail.photos} /></div>
         {detail.status === 'rework' && <div className="ops-rework-reason"><span className="section-label">ЗАМЕЧАНИЕ ИНСПЕКТОРА</span><strong>Требуется доработка</strong><p>{[...detail.repairs].reverse().find((r) => r.decision === 'rejected')?.decision_comment || [...detail.history].reverse().find((e) => e.action === 'reject')?.comment || 'Инспектор вернул работу на повторную проверку.'}</p></div>}
