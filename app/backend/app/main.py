@@ -624,17 +624,31 @@ async def upload_file(file: UploadFile = File(...), user: UserRow = Depends(curr
     data = await file.read(10 * 1024 * 1024 + 1)
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(413, detail={"code": "FILE_TOO_LARGE", "message": "Максимальный размер фото — 10 МБ"})
-    ctype = (file.content_type or "").lower()
+    if not data:
+        raise HTTPException(422, detail={"code": "EMPTY_FILE", "message": "Выбранный файл пуст. Выберите фотографию и повторите попытку"})
+    ctype = (file.content_type or "").split(";", 1)[0].strip().lower()
+    suffix = Path(file.filename or "").suffix.lower()
+    heif_brands = (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1")
+    is_heif = ctype in ("image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence") or suffix in (".heic", ".heif") or (
+        len(data) >= 12 and data[4:8] == b"ftyp" and any(data[8:32].find(brand) >= 0 for brand in heif_brands)
+    )
+    if is_heif:
+        raise HTTPException(415, detail={"code": "UNSUPPORTED_IMAGE_FORMAT", "message": "Формат HEIC/HEIF пока не поддерживается. Сохраните фото как JPEG или PNG и выберите его повторно"})
     try:
         with Image.open(BytesIO(data)) as image:
             actual_type = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}.get(image.format)
             image.verify()
     except (UnidentifiedImageError, OSError, ValueError):
         actual_type = None
-    if ctype not in ("image/jpeg", "image/png", "image/webp") or actual_type != ctype:
-        raise HTTPException(415, detail={"code": "INVALID_IMAGE", "message": "Загрузите корректное фото JPEG, PNG или WebP"})
+    if actual_type is None:
+        raise HTTPException(415, detail={"code": "INVALID_IMAGE", "message": "Файл повреждён или не является фотографией JPEG, PNG или WebP"})
+    # Browsers can supply a missing or misleading file.type. Trust Pillow's
+    # content sniff after verification, and use that detected type for storage
+    # and downloads instead of rejecting an otherwise valid original.
+    ctype = actual_type
     pid = str(uuid.uuid4())
-    path = PHOTO_DIR / f"{pid}{Path(file.filename or 'photo').suffix.lower()[:8]}"
+    extension = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[ctype]
+    path = PHOTO_DIR / f"{pid}{extension}"
     path.write_bytes(data)
     db.add(PhotoRow(id=pid, owner_id=user.id, name=Path(file.filename or "Фото").name[:255], content_type=ctype, path=str(path), sha256=hashlib.sha256(data).hexdigest()))
     db.commit()

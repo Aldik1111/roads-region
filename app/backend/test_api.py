@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+from io import BytesIO
 from pathlib import Path
 
 # Keep both test database and uploads away from the app's live local data.
@@ -10,6 +11,7 @@ os.environ["PHOTO_DIR"] = TEST_PHOTO_DIR.name
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fastapi.testclient import TestClient
+from PIL import Image
 import app.main as main
 from app.main import DefectRow, PhotoRow, SessionLocal, app
 
@@ -288,6 +290,68 @@ def test_missing_photo_file_returns_json_404():
     assert response.status_code == 404
     assert response.headers["content-type"].startswith("application/json")
     assert response.json()["code"] == "NOT_FOUND"
+
+
+def make_image_bytes(fmt):
+    buffer = BytesIO()
+    Image.new("RGB", (3, 2), color=(32, 96, 64)).save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
+def test_upload_accepts_jpeg_png_webp_and_returns_original_bytes():
+    login("inspector@roads.local")
+    for extension, media_type, image_format in (
+        ("jpg", "image/jpeg", "JPEG"),
+        ("png", "image/png", "PNG"),
+        ("webp", "image/webp", "WEBP"),
+    ):
+        original = make_image_bytes(image_format)
+        response = client.post("/api/files", files={"file": (f"test.{extension}", original, media_type)})
+        assert response.status_code == 200, response.text
+        photo = response.json()
+        downloaded = client.get(photo["url"])
+        assert downloaded.status_code == 200
+        assert downloaded.content == original
+        assert downloaded.headers["content-type"] == media_type
+
+
+def test_upload_validation_distinguishes_empty_corrupt_and_heic():
+    login("inspector@roads.local")
+    cases = (
+        (("empty.jpg", b"", "image/jpeg"), 422, "EMPTY_FILE"),
+        (("corrupt.jpg", b"not a JPEG image", "image/jpeg"), 415, "INVALID_IMAGE"),
+        (("phone.heic", b"00000018ftypheic00000000", "image/heic"), 415, "UNSUPPORTED_IMAGE_FORMAT"),
+    )
+    for upload, expected_status, expected_code in cases:
+        response = client.post("/api/files", files={"file": upload})
+        assert response.status_code == expected_status, response.text
+        assert response.json()["code"] == expected_code
+        assert response.json()["message"]
+
+
+def test_upload_uses_sniffed_format_when_browser_mime_is_missing_generic_or_wrong():
+    login("inspector@roads.local")
+    cases = (
+        ("missing.jpg", make_image_bytes("JPEG"), "" , "image/jpeg"),
+        ("generic.png", make_image_bytes("PNG"), "application/x-binary", "image/png"),
+        ("wrong-label.webp", make_image_bytes("WEBP"), "image/png", "image/webp"),
+    )
+    for filename, original, reported_type, detected_type in cases:
+        response = client.post("/api/files", files={"file": (filename, original, reported_type)})
+        assert response.status_code == 200, response.text
+        photo = response.json()
+        downloaded = client.get(photo["url"])
+        assert downloaded.status_code == 200
+        assert downloaded.content == original
+        assert downloaded.headers["content-type"] == detected_type
+
+
+def test_upload_rejects_over_10_mib_before_image_decode():
+    login("inspector@roads.local")
+    content = b"\x00" * (10 * 1024 * 1024 + 1)
+    response = client.post("/api/files", files={"file": ("oversized.png", content, "image/png")})
+    assert response.status_code == 413
+    assert response.json()["code"] == "FILE_TOO_LARGE"
 
 
 def osrm_response(*, multiple=False):

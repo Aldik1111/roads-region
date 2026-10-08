@@ -25,3 +25,5 @@
 .selected-location-pin:after{content:'';position:absolute;inset:7px;border-radius:50%;background:white}
 .map-location-status{position:absolute;left:54px;right:64px;top:12px;z-index:500;padding:8px 10px;border-radius:8px;background:#ffffffed;color:#41645a;font-size:11px;box-shadow:0 1px 4px #15382b20;pointer-events:none}
 @media(max-width:760px){.workspace-tabs{margin-bottom:20px}.workspace-tabs button{flex:1;padding:10px 14px}.map-caption{font-size:9px;gap:5px}}
+.photo-upload-zone{cursor:default}.upload-zone .photo-file-input{display:none}.upload-actions{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin-top:6px}.upload-filename{font-size:11px;overflow-wrap:anywhere;max-width:100%;color:#536e61}.upload-success{display:flex;align-items:center;gap:7px;margin-top:10px;font-size:11px;color:#126e60;overflow-wrap:anywhere}.upload-error{display:flex;flex-direction:column;align-items:flex-start;gap:10px;margin-top:10px}.upload-camera{display:none}@media(pointer:coarse){.upload-camera{display:inline-flex}}
+.upload-actions .upload-camera{display:none}@media(pointer:coarse){.upload-actions .upload-camera{display:inline-flex}}

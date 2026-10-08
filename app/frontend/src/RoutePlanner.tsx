@@ -214,7 +214,7 @@ export default function RoutePlanner({ user }: Props) {
           <div className="rp-point-pickers"><button className={`rp-point-picker ${pointMode === 'start' ? 'active' : ''} ${start ? 'complete' : ''}`} onClick={() => setPointMode('start')} disabled={publishBusy || !!pendingPublish}><i className="rp-start-dot">A</i><span><small>НАЧАЛО</small><strong>{pointLabel(start)}</strong></span></button><ArrowDownRight className="rp-point-arrow" size={17}/><button className={`rp-point-picker ${pointMode === 'end' ? 'active' : ''} ${end ? 'complete' : ''}`} onClick={() => setPointMode('end')} disabled={publishBusy || !!pendingPublish}><i className="rp-end-dot">B</i><span><small>КОНЕЦ</small><strong>{pointLabel(end)}</strong></span></button><button className="rp-clear-points" onClick={() => { setStart(null); setEnd(null); setStartLatInput(''); setStartLngInput(''); setEndLatInput(''); setEndLngInput(''); setPointMode('start'); setPointError(''); resetPreview(); }} disabled={(!start && !end) || publishBusy || !!pendingPublish} aria-label="Очистить точки"><X size={16}/></button></div>
           <details className="rp-coordinate-entry"><summary>Ввести координаты вручную</summary><div className="rp-coordinate-fields"><CoordinateForm name="Начало" lat={startLatInput} lng={startLngInput} setLat={setStartLatInput} setLng={setStartLngInput} onApply={() => applyManualPoint('start')} disabled={publishBusy || !!pendingPublish}/><CoordinateForm name="Конец" lat={endLatInput} lng={endLngInput} setLat={setEndLatInput} setLng={setEndLngInput} onApply={() => applyManualPoint('end')} disabled={publishBusy || !!pendingPublish}/></div>{pointError && <div className="rp-coordinate-error" role="alert">{pointError}</div>}</details>
           {!deviceLocation.position ? <div className={`rp-location-status ${deviceLocation.error ? 'failed' : ''}`} role="status" aria-live="polite"><MapPin size={15}/><span>{deviceLocation.error ? `Местоположение не получено. ${deviceLocation.error}` : 'Определяем ваше местоположение…'} Пока показан обзор области.</span>{deviceLocation.error && <button type="button" onClick={deviceLocation.retry}>Повторить</button>}</div> : <div className="rp-location-status ready" role="status"><MapPin size={15}/><span>Моё местоположение · точность около {Math.round(deviceLocation.position.accuracy_m)} м</span></div>}
-          <div className="rp-map-frame"><PlannerMap start={preview?.start ?? start} end={preview?.end ?? end} options={displayedOptions} selectedOptionId={selectedOptionId} decisionPoints={preview?.decision_points ?? []} location={deviceLocation.position} locationReady={deviceLocation.ready} hasEndpoints={!!start || !!end} mapInteracted={mapInteracted} onMapClick={handleMapClick} onSelectOption={setSelectedOptionId} loading={previewLoading} locked={publishBusy || !!pendingPublish}/></div>
+          <div className="rp-map-frame"><PlannerMap start={preview?.start ?? start} end={preview?.end ?? end} options={displayedOptions} previewId={preview?.id ?? null} selectedOptionId={selectedOptionId} decisionPoints={preview?.decision_points ?? []} location={deviceLocation.position} locationReady={deviceLocation.ready} hasEndpoints={!!start || !!end} mapInteracted={mapInteracted} onMapClick={handleMapClick} onSelectOption={setSelectedOptionId} loading={previewLoading} locked={publishBusy || !!pendingPublish}/></div>
           <div className="rp-map-legend"><span><i className="rp-legend-point"/>Точка A</span><span><i className="rp-legend-point end"/>Точка B</span>{preview?.decision_points.length ? <span><i className="rp-legend-junction"/>Развилка вариантов</span> : null}<span className="rp-map-help">{pointMode === 'start' ? 'Выбрано начало' : 'Выбран конец'}</span></div>
           {snappedDistance > 5 && <div className="rp-snap-note"><MapPin size={14}/>Точки привязаны к ближайшей дороге. В полях выше остаются указанные координаты.</div>}
         </div>
@@ -269,10 +269,10 @@ function RouteOptionCard({ option, index, selected, multi, onSelect, disabled = 
 }
 
 type DevicePosition = { lat: number; lng: number; accuracy_m: number; recorded_at: string };
-function PlannerMap({ start, end, options, selectedOptionId, decisionPoints, location, locationReady, hasEndpoints, mapInteracted, onMapClick, onSelectOption, loading, locked }: { start: RoutePoint | null; end: RoutePoint | null; options: RouteOption[]; selectedOptionId: string | null; decisionPoints: RoutePreview['decision_points']; location: DevicePosition | null; locationReady: boolean; hasEndpoints: boolean; mapInteracted: MutableRefObject<boolean>; onMapClick: (lat: number, lng: number) => void; onSelectOption: (id: string) => void; loading: boolean; locked: boolean }) {
+function PlannerMap({ start, end, options, previewId, selectedOptionId, decisionPoints, location, locationReady, hasEndpoints, mapInteracted, onMapClick, onSelectOption, loading, locked }: { start: RoutePoint | null; end: RoutePoint | null; options: RouteOption[]; previewId: string | null; selectedOptionId: string | null; decisionPoints: RoutePreview['decision_points']; location: DevicePosition | null; locationReady: boolean; hasEndpoints: boolean; mapInteracted: MutableRefObject<boolean>; onMapClick: (lat: number, lng: number) => void; onSelectOption: (id: string) => void; loading: boolean; locked: boolean }) {
   const [tileError, setTileError] = useState(false);
   const mapRef = useRef<L.Map | null>(null);
-  return <div className={`rp-leaflet ${loading ? 'loading' : ''}`}><MapContainer center={DEFAULT_CENTER} zoom={5} scrollWheelZoom touchZoom zoomAnimation={false} fadeAnimation={false} markerZoomAnimation={false} style={{ height: '100%', width: '100%' }}><PlannerMapBehavior mapRef={mapRef} start={start} end={end} options={options} selectedOptionId={selectedOptionId} location={location} locationReady={locationReady} hasEndpoints={hasEndpoints} mapInteracted={mapInteracted} onMapClick={onMapClick}/><TileLayer url="https://tile.openstreetmap.org/{z}/{x}/{y}.png" attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' eventHandlers={{ tileerror: () => setTileError(true) }}/>
+  return <div className={`rp-leaflet ${loading ? 'loading' : ''}`}><MapContainer center={DEFAULT_CENTER} zoom={5} scrollWheelZoom touchZoom zoomSnap={0.25} zoomDelta={0.5} wheelPxPerZoomLevel={180} inertia={false} zoomAnimation={false} fadeAnimation={false} markerZoomAnimation={false} style={{ height: '100%', width: '100%' }}><PlannerMapBehavior mapRef={mapRef} start={start} end={end} options={options} previewId={previewId} location={location} locationReady={locationReady} hasEndpoints={hasEndpoints} mapInteracted={mapInteracted} onMapClick={onMapClick}/><TileLayer url="https://tile.openstreetmap.org/{z}/{x}/{y}.png" attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' eventHandlers={{ tileerror: () => setTileError(true) }}/>
     {options.map((option, index) => (
       <Polyline key={option.id} positions={fromCoordinates(option.geometry.coordinates)} bubblingMouseEvents={false} pathOptions={{ color: ROUTE_COLORS[index % ROUTE_COLORS.length], weight: option.id === selectedOptionId ? 8 : selectedOptionId ? 4 : 5, opacity: selectedOptionId && option.id !== selectedOptionId ? .36 : .9 }} eventHandlers={{ click: () => { if (!locked) onSelectOption(option.id); } }} />
     ))}
@@ -282,28 +282,28 @@ function PlannerMap({ start, end, options, selectedOptionId, decisionPoints, loc
   </MapContainer>{locationReady && location && <button type="button" className="rp-locate-button" ref={(node) => { if (node) L.DomEvent.disableClickPropagation(node); }} onClick={() => mapRef.current?.setView([location.lat, location.lng], 15, { animate: false })}><LocateFixed size={15}/>Моё местоположение</button>}{tileError && <div className="rp-tile-error">Картографическая подложка недоступна. Линии маршрута сохранены.</div>}</div>;
 }
 
-function PlannerMapBehavior({ mapRef, start, end, options, selectedOptionId, location, locationReady, hasEndpoints, mapInteracted, onMapClick }: { mapRef: MutableRefObject<L.Map | null>; start: RoutePoint | null; end: RoutePoint | null; options: RouteOption[]; selectedOptionId: string | null; location: DevicePosition | null; locationReady: boolean; hasEndpoints: boolean; mapInteracted: MutableRefObject<boolean>; onMapClick: (lat: number, lng: number) => void }) {
+function PlannerMapBehavior({ mapRef, start, end, options, previewId, location, locationReady, hasEndpoints, mapInteracted, onMapClick }: { mapRef: MutableRefObject<L.Map | null>; start: RoutePoint | null; end: RoutePoint | null; options: RouteOption[]; previewId: string | null; location: DevicePosition | null; locationReady: boolean; hasEndpoints: boolean; mapInteracted: MutableRefObject<boolean>; onMapClick: (lat: number, lng: number) => void }) {
   const map = useMap();
   mapRef.current = map;
   const autoCenteredOnGps = useRef(false);
+  const fittedPreviewId = useRef<string | null>(null);
   useMapEvents({ click: (event) => onMapClick(event.latlng.lat, event.latlng.lng), dragstart: () => { mapInteracted.current = true; }, zoomstart: () => { mapInteracted.current = true; } });
   useEffect(() => {
-    const chosen = options.find((option) => option.id === selectedOptionId);
-    const coordinates = chosen?.geometry.coordinates ?? options.flatMap((option) => option.geometry.coordinates);
+    if (!previewId || previewId === fittedPreviewId.current || options.length === 0) return;
+    fittedPreviewId.current = previewId;
+    const coordinates = options.flatMap((option) => option.geometry.coordinates);
     const latlngs: L.LatLngExpression[] = coordinates.map(([lng, lat]) => [lat, lng]);
     if (start) latlngs.push(toLatLng(start));
     if (end) latlngs.push(toLatLng(end));
-    if (latlngs.length) map.fitBounds(L.latLngBounds(latlngs), { padding: [32, 32], maxZoom: 14, animate: false });
-    else if (start && end) map.fitBounds(L.latLngBounds([toLatLng(start), toLatLng(end)]), { padding: [40, 40], maxZoom: 14, animate: false });
-    else if (start || end) map.setView(toLatLng((start ?? end)!), 13, { animate: false });
-  }, [map, start?.lat, start?.lng, end?.lat, end?.lng, options, selectedOptionId]);
+    if (latlngs.length > 1) map.fitBounds(L.latLngBounds(latlngs), { padding: [32, 32], maxZoom: 14, animate: false });
+  }, [map, previewId, options, start?.lat, start?.lng, end?.lat, end?.lng]);
   useEffect(() => {
     if (!locationReady || !location || autoCenteredOnGps.current) return;
     autoCenteredOnGps.current = true;
     if (!hasEndpoints && !mapInteracted.current) map.setView([location.lat, location.lng], 15, { animate: false });
   }, [map, locationReady, location?.lat, location?.lng, hasEndpoints, mapInteracted]);
   useEffect(() => {
-    const resizeObserver = new ResizeObserver(() => map.invalidateSize());
+    const resizeObserver = new ResizeObserver(() => map.invalidateSize({ pan: false }));
     resizeObserver.observe(map.getContainer());
     return () => resizeObserver.disconnect();
   }, [map]);
