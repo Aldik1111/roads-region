@@ -2,7 +2,16 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { setMutationGuard } from './api';
 
 export type DevicePosition = { lat: number; lng: number; accuracy_m: number; recorded_at: string };
-type LocationState = { position: DevicePosition | null; ready: boolean; error: string; status: 'requesting' | 'ready' | 'unavailable'; retry: () => void };
+type LocationState = {
+  position: DevicePosition | null;
+  ready: boolean;
+  hasFreshPosition: boolean;
+  error: string;
+  status: 'requesting' | 'ready' | 'reconnecting' | 'unavailable';
+  recoveryRemainingSeconds: number;
+  showRecoveryNotice: boolean;
+  retry: () => void;
+};
 type PagePermission = PermissionState | 'unknown';
 const MAX_FIX_AGE_MS = 30_000;
 const LocationContext = createContext<LocationState | null>(null);
@@ -33,8 +42,15 @@ export function LocationProvider({ children, requireGps = false }: { children: R
   const [position, setPosition] = useState<DevicePosition | null>(null);
   const [error, setError] = useState('');
   const [requesting, setRequesting] = useState(true);
+  const [recoveryDeadline, setRecoveryDeadline] = useState<number | null>(null);
+  const [recoveryStartedAt, setRecoveryStartedAt] = useState<number | null>(null);
+  const [clock, setClock] = useState(() => Date.now());
   const [revision, setRevision] = useState(0);
   const latest = useRef<DevicePosition | null>(null);
+  const recoveryDeadlineRef = useRef<number | null>(null);
+  const recoveryStartedAtRef = useRef<number | null>(null);
+  const recoveryForFixRef = useRef('');
+  const providerIssueRef = useRef('');
   const retry = useCallback(() => setRevision(value => value + 1), []);
 
   useEffect(() => {
@@ -49,7 +65,26 @@ export function LocationProvider({ children, requireGps = false }: { children: R
     let refreshInFlight = false;
     let refreshForFix = '';
     let permissionGrantedRestarted = false;
-    let providerIssue = '';
+    const inRecovery = (at = Date.now()) => recoveryDeadlineRef.current !== null && recoveryDeadlineRef.current > at;
+    const beginRecovery = (fix: DevicePosition) => {
+      if (recoveryForFixRef.current === fix.recorded_at) return;
+      const fixTime = Date.parse(fix.recorded_at);
+      const age = Date.now() - fixTime;
+      const startedAt = age >= MAX_FIX_AGE_MS ? fixTime + MAX_FIX_AGE_MS : Date.now();
+      const deadline = age >= MAX_FIX_AGE_MS ? fixTime + MAX_FIX_AGE_MS + 60_000 : startedAt + 60_000;
+      recoveryForFixRef.current = fix.recorded_at;
+      recoveryStartedAtRef.current = startedAt;
+      recoveryDeadlineRef.current = deadline;
+      setRecoveryStartedAt(startedAt);
+      setRecoveryDeadline(deadline);
+    };
+    const clearRecovery = () => {
+      recoveryForFixRef.current = '';
+      recoveryStartedAtRef.current = null;
+      recoveryDeadlineRef.current = null;
+      setRecoveryStartedAt(null);
+      setRecoveryDeadline(null);
+    };
 
     const stopWatch = () => {
       generation += 1;
@@ -60,18 +95,21 @@ export function LocationProvider({ children, requireGps = false }: { children: R
       watchId = null;
     };
     const clearFix = (message: string) => {
-      providerIssue = '';
+      providerIssueRef.current = '';
       refreshForFix = '';
+      clearRecovery();
       latest.current = null;
       setPosition(null);
       setError(message);
       setRequesting(false);
     };
     const recordProviderIssue = (message: string) => {
-      providerIssue = message;
+      providerIssueRef.current = message;
       setError(message);
-      if (!hasFreshFix(latest.current)) {
-        latest.current = null;
+      if (latest.current) {
+        beginRecovery(latest.current);
+        setPosition(null);
+      } else {
         setPosition(null);
         setRequesting(false);
       }
@@ -89,7 +127,7 @@ export function LocationProvider({ children, requireGps = false }: { children: R
 
     const fresh = (fix: GeolocationPosition) => {
       if (disposed || denied || document.visibilityState !== 'visible') return;
-      if (latest.current && fix.timestamp < Date.parse(latest.current.recorded_at)) return;
+      if (latest.current && fix.timestamp <= Date.parse(latest.current.recorded_at)) return;
       const age = Date.now() - fix.timestamp;
       if (!Number.isFinite(fix.timestamp) || age > MAX_FIX_AGE_MS || age < -5000 || !Number.isFinite(fix.coords.latitude) || !Number.isFinite(fix.coords.longitude) || !Number.isFinite(fix.coords.accuracy)) {
         recordProviderIssue('Браузер не получил актуальную позицию. Повторяем поиск GPS.');
@@ -100,11 +138,13 @@ export function LocationProvider({ children, requireGps = false }: { children: R
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       retryTimer = null;
       lastFailure = null;
-      providerIssue = '';
+      providerIssueRef.current = '';
       latest.current = next;
       setPosition(next);
       setError('');
       setRequesting(false);
+      clearRecovery();
+      setClock(Date.now());
     };
 
     const failed = (failure: GeolocationPositionError) => {
@@ -120,9 +160,13 @@ export function LocationProvider({ children, requireGps = false }: { children: R
       }
       if (failure.code === 1) {
         stopWatch();
-        clearFix(pagePermission === 'granted'
+        const message = pagePermission === 'granted'
           ? `Разрешение сайта в браузере выдано, но позиция не получена. Возможна блокировка системным источником геолокации или средой встроенного браузера.${windowsLocationHelp()} Закройте диалог выбора файла, если он открыт, либо откройте страницу в отдельной вкладке и нажмите «Повторить определение».`
-          : `Запрос геолокации отклонён, но разрешение страницы не подтверждено. Проверьте доступ для сайта в браузере и системную геолокацию.${windowsLocationHelp()} Затем нажмите «Повторить определение».`);
+          : `Запрос геолокации отклонён, но разрешение страницы не подтверждено. Проверьте доступ для сайта в браузере и системную геолокацию.${windowsLocationHelp()} Затем нажмите «Повторить определение».`;
+        if (latest.current) {
+          recordProviderIssue(message);
+          scheduleRecovery();
+        } else clearFix(message);
         return;
       }
       const message = failure.code === 3
@@ -169,10 +213,11 @@ export function LocationProvider({ children, requireGps = false }: { children: R
       }, refreshOptions);
     };
 
-    latest.current = null;
-    setPosition(null);
-    setError('');
-    setRequesting(true);
+    const preservedFix = latest.current;
+    const preservedPosition = preservedFix && hasFreshFix(preservedFix) && !providerIssueRef.current ? preservedFix : null;
+    setPosition(preservedPosition);
+    setError(providerIssueRef.current);
+    setRequesting(!preservedPosition && !inRecovery());
     if (!navigator.geolocation || !window.isSecureContext) {
       clearFix('Геолокация недоступна. Откройте приложение через HTTPS или localhost.');
       return () => { disposed = true; };
@@ -191,9 +236,11 @@ export function LocationProvider({ children, requireGps = false }: { children: R
           clearFix('Браузер запретил этой странице доступ к геолокации. Разрешите местоположение для сайта в настройках браузера.');
         } else {
           lastFailure = null;
-          providerIssue = '';
-          setError('');
-          setRequesting(!hasFreshFix(latest.current));
+          if (!latest.current) {
+            providerIssueRef.current = '';
+            setError('');
+          }
+          setRequesting(!hasFreshFix(latest.current) && !inRecovery());
           startWatch();
         }
       };
@@ -202,19 +249,31 @@ export function LocationProvider({ children, requireGps = false }: { children: R
         permissionGrantedRestarted = true;
         denied = false;
         lastFailure = null;
-        providerIssue = '';
-        setError('');
-        setRequesting(!hasFreshFix(latest.current));
+        if (!latest.current) {
+          providerIssueRef.current = '';
+          setError('');
+        }
+        setRequesting(!hasFreshFix(latest.current) && !inRecovery());
         startWatch();
       } else if (lastFailure?.code === 1) failed(lastFailure);
     }).catch(() => { pagePermission = 'unknown'; /* Geolocation callbacks still identify provider errors. */ });
 
     const expiryTimer = window.setInterval(() => {
+      const now = Date.now();
+      setClock(now);
       const fix = latest.current;
       if (!fix) return;
       const age = Date.now() - Date.parse(fix.recorded_at);
       if (!hasFreshFix(fix)) {
-        clearFix(providerIssue || 'GPS-сигнал потерян. Работа приостановлена до получения актуальной позиции.');
+        if (recoveryForFixRef.current !== fix.recorded_at) {
+          if (!providerIssueRef.current) {
+            providerIssueRef.current = 'GPS-сигнал потерян. Работа приостановлена до получения актуальной позиции.';
+            setError(providerIssueRef.current);
+          }
+          beginRecovery(fix);
+          setPosition(null);
+        }
+        if (!inRecovery(now)) setRequesting(true);
         scheduleRecovery();
       } else if (age >= 20_000 && refreshForFix !== fix.recorded_at) {
         refreshFix();
@@ -222,11 +281,22 @@ export function LocationProvider({ children, requireGps = false }: { children: R
     }, 1000);
     const visibility = () => {
       if (document.visibilityState === 'visible') {
-        setRequesting(!hasFreshFix(latest.current));
+        const fix = latest.current;
+        if (fix && !hasFreshFix(fix) && recoveryForFixRef.current !== fix.recorded_at) {
+          if (!providerIssueRef.current) {
+            providerIssueRef.current = 'GPS-сигнал потерян. Работа приостановлена до получения актуальной позиции.';
+            setError(providerIssueRef.current);
+          }
+          beginRecovery(fix);
+          setPosition(null);
+        }
+        setClock(Date.now());
+        setRequesting(!hasFreshFix(latest.current) && !inRecovery());
         startWatch();
       } else {
         stopWatch();
-        if (!hasFreshFix(latest.current)) setRequesting(false);
+        setClock(Date.now());
+        if (!hasFreshFix(latest.current) && !inRecovery()) setRequesting(false);
         // A hidden window (for example, while a native file chooser is open) is not itself GPS loss.
       }
     };
@@ -238,15 +308,30 @@ export function LocationProvider({ children, requireGps = false }: { children: R
     if (!requireGps) return;
     setMutationGuard(() => {
       const fix = latest.current;
-      return hasFreshFix(fix) && document.visibilityState === 'visible' ? null : 'Для работы инспектора требуется актуальная GPS-позиция. Включите геолокацию.';
+      const liveFix = hasFreshFix(fix) && !providerIssueRef.current;
+      const recoveryAccess = recoveryDeadlineRef.current !== null && recoveryDeadlineRef.current > Date.now();
+      return (liveFix || recoveryAccess) && document.visibilityState === 'visible' ? null : 'Для работы инспектора требуется актуальная GPS-позиция. Включите геолокацию.';
     });
     return () => setMutationGuard(null);
   }, [requireGps]);
 
   const value = useMemo<LocationState>(() => {
-    const ready = hasFreshFix(position);
-    return { position: ready ? position : null, ready, error, status: ready ? 'ready' : requesting ? 'requesting' : 'unavailable', retry };
-  }, [position, error, requesting, retry]);
+    const hasFreshPosition = hasFreshFix(position) && !error;
+    const recoveryRemainingSeconds = recoveryDeadline === null ? 0 : Math.max(0, Math.ceil((recoveryDeadline - clock) / 1000));
+    const recovering = recoveryRemainingSeconds > 0;
+    const ready = hasFreshPosition || recovering;
+    const showRecoveryNotice = recovering && recoveryStartedAt !== null && clock - recoveryStartedAt >= 15_000;
+    return {
+      position: hasFreshPosition ? position : null,
+      ready,
+      hasFreshPosition,
+      error,
+      status: hasFreshPosition ? 'ready' : recovering ? 'reconnecting' : recoveryDeadline !== null ? 'unavailable' : requesting ? 'requesting' : 'unavailable',
+      recoveryRemainingSeconds,
+      showRecoveryNotice,
+      retry,
+    };
+  }, [position, error, requesting, recoveryDeadline, recoveryStartedAt, clock, retry]);
   return <LocationContext.Provider value={value}>{children}</LocationContext.Provider>;
 }
 

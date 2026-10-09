@@ -108,13 +108,16 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
 
   useEffect(() => {
     const position = location.position;
-    if (!location.ready || !position) return;
+    if (!location.hasFreshPosition || !position) return;
     const fix: LocationFix = { lat: position.lat, lng: position.lng, accuracy_m: position.accuracy_m, source: 'gps' };
     if (view === 'survey') setGps((current) => current?.source === 'manual' ? current : fix);
-  }, [location.position, location.ready, view]);
+    // A form opened during recovery receives its first fix once GPS returns.
+    // Existing form coordinates remain stable for edits and idempotent retries.
+    if (view === 'create') setGps((current) => current ?? fix);
+  }, [location.position, location.hasFreshPosition, view]);
 
   useEffect(() => {
-    if (finishingInspection.current || document.visibilityState !== 'visible' || !location.ready || !location.position || inspection?.status !== 'active') return;
+    if (finishingInspection.current || document.visibilityState !== 'visible' || !location.hasFreshPosition || !location.position || inspection?.status !== 'active') return;
     const { position } = location;
     const stamp = position.recorded_at;
     if (stamp !== lastSentPoint.current) {
@@ -122,7 +125,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
       pendingPoints.current.push({ client_id: uuid(), lat: position.lat, lng: position.lng, recorded_at: stamp, accuracy_m: position.accuracy_m });
     }
     if (pendingPoints.current.length) void sendPendingPoints(inspection.id);
-  }, [inspection?.id, inspection?.status, location.position, location.ready, sendPendingPoints]);
+  }, [inspection?.id, inspection?.status, location.position, location.hasFreshPosition, sendPendingPoints]);
 
   const openSection = async (s: Section, repeat = false) => {
     if (!location.ready) return;
@@ -132,6 +135,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
       setError(`Сначала завершите осмотр маршрута ${sections.find((route) => route.id === inspection.section_id)?.name ?? 'из списка выше'}. Одновременно можно вести только один осмотр.`);
       return;
     }
+    if (!location.hasFreshPosition) return;
     if (s.state === 'completed' && !repeat) {
       setError('Этот маршрут уже осмотрен. Для нового осмотра выберите «Повторить осмотр».');
       return;
@@ -211,13 +215,13 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
     const needsRoute = !previousId && !fromActiveSurvey && !listSectionId;
     setCreateNeedsRoute(needsRoute);
     if (previousId) setGps((previous) => previous ?? null);
-    else if (!fromActiveSurvey) setGps(location.position ? { lat: location.position.lat, lng: location.position.lng, accuracy_m: location.position.accuracy_m, source: 'gps' } : null);
+    else setGps((current) => fromActiveSurvey && current?.source === 'manual' ? current : location.position ? { lat: location.position.lat, lng: location.position.lng, accuracy_m: location.position.accuracy_m, source: 'gps' } : null);
     setView('create');
   };
 
   const submitDefect = async (e: FormEvent) => {
     e.preventDefault();
-    if (!location.ready) { setError('Для отправки включите GPS устройства.'); return; }
+    if (!location.hasFreshPosition) return;
     if (photoUploading) { setError('Дождитесь завершения загрузки фотографии.'); return; }
     if (!section || !gps) { setError('Отметьте место на карте или скорректируйте координаты при включённом GPS.'); return; }
     if (!photos.length) { setError('Добавьте хотя бы одну фотографию перед отправкой.'); return; }
@@ -292,6 +296,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
     <div className="inspector-workspace" aria-hidden={!location.ready} inert={!location.ready}>
     <main className="inspector-main">
       <div className="inspector-pagehead"><div><div className="eyebrow">ПОЛЕВОЙ КАБИНЕТ</div><h1>{pageTitle(view, section)}</h1><p className="muted">{view === 'sections' ? 'Выберите назначенный маршрут и начните осмотр' : view === 'survey' ? 'Записывайте маршрут и отмечайте найденные дефекты' : view === 'create' ? 'Сохраните исходную фотографию и точку обнаружения' : view === 'list' ? 'Сообщения и дефекты, ожидающие проверки' : view === 'history' ? 'Пройденные маршруты, GPS-треки и замечания' : 'История и фотографии сохраняются в карточке дефекта'}</p></div>{view === 'sections' && <button className="button primary inspector-head-action" onClick={() => void openList('created')}><Icon name="clipboard" size={17} /> Мои дефекты</button>}</div>
+      {location.status === 'reconnecting' && location.showRecoveryNotice && <div className="inspector-gps-recovery"><Icon name="locate" size={19}/><div><b role="status">Восстанавливаем GPS-сигнал</b><p>Можно продолжать заполнять форму и добавлять фото. Отправка дефекта станет доступна после восстановления GPS.</p></div><span>Ещё {location.recoveryRemainingSeconds} с</span></div>}
       {error && <div className="alert error" role="alert">{error}</div>}{notice && <div className="alert success" role="status">{notice}<button className="inspector-alert-close" aria-label="Закрыть" onClick={() => setNotice('')}>×</button></div>}
       {loading ? <div className="card inspector-loading"><span className="inspector-spinner" /> Загружаем данные…</div> : <>
         {view === 'sections' && <section className="inspector-sections-view">
@@ -307,7 +312,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
                 {s.notes && <p className="inspector-route-notes">{s.notes}</p>}
                 <div className="inspector-section-meta"><span><Icon name="user" size={15} /> {s.inspector_name || user.name}</span><span><Icon name="alert" size={15} /> {defects.filter((d) => d.section_id === s.id && !['closed','cancelled'].includes(d.status)).length} открытых</span></div>
                 <div className="inspector-route-state"><span className={`inspector-route-state-pill ${s.state}`}>{routeStateLabel(s.state)}</span>{latest && <span>Последний осмотр: {formatDate(latest.finished_at)}</span>}{Number.isFinite(s.duration_min) && s.duration_min > 0 && <span>Расчётное время · {durationLabel(s.duration_min)}</span>}</div>
-                <div className="inspector-section-footer">{active ? <button className="button primary" onClick={() => goToSectionSurvey(s)}>Продолжить осмотр <Icon name="arrow" size={16} /></button> : <button className="button secondary" disabled={busy || activeElsewhere} title={activeElsewhere ? 'Сначала завершите активный осмотр другого маршрута' : undefined} onClick={() => void openSection(s, completed)}><Icon name={completed ? 'refresh' : 'route'} size={16} /> {activeElsewhere ? 'Другой осмотр активен' : completed ? 'Повторить осмотр' : 'Начать осмотр'}</button>}
+                <div className="inspector-section-footer">{active ? <button className="button primary" onClick={() => goToSectionSurvey(s)}>Продолжить осмотр <Icon name="arrow" size={16} /></button> : <button className="button secondary" disabled={busy || activeElsewhere || !location.hasFreshPosition} title={activeElsewhere ? 'Сначала завершите активный осмотр другого маршрута' : undefined} onClick={() => void openSection(s, completed)}><Icon name={completed ? 'refresh' : 'route'} size={16} /> {activeElsewhere ? 'Другой осмотр активен' : !location.hasFreshPosition ? 'Ожидаем GPS' : completed ? 'Повторить осмотр' : 'Начать осмотр'}</button>}
                   {activeElsewhere && <small className="inspector-route-disabled-reason">Сначала завершите активный маршрут</small>}
                   <div className="inspector-route-links">{completed && <button className="button secondary small" onClick={() => void openRouteHistory(s)} disabled={busy}><Icon name="history" size={15}/> История</button>}<button className="inspector-icon-button" aria-label="Дефекты маршрута" title="Дефекты маршрута" onClick={() => void openList('created', s.id)}><Icon name="clipboard" size={18} /></button></div>
                 </div>
@@ -330,7 +335,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
         {view === 'survey' && section && inspection && <section className="inspector-survey-view">
           <div className="inspector-survey-top"><button className="button secondary small" onClick={() => setView('sections')}><Icon name="left" size={16}/> Мои маршруты</button><div className="inspector-live"><i/> ИДЁТ ОСМОТР</div><span className="inspector-survey-start">Начат {formatDate(inspection.started_at)}</span></div>
           <div className="inspector-survey-map card"><MapView section={section} defects={sectionDefects} track={inspection.points} selectedPosition={gps ? {lat:gps.lat,lng:gps.lng} : null} onPosition={(lat,lng) => { if (!location.ready) return; setGps({lat,lng,accuracy_m:null,source:'manual'}); setManualLat(String(lat)); setManualLng(String(lng)); }} height={420} /></div>
-          <div className="inspector-metrics"><div className="stat"><span>Время</span><strong>{elapsed(surveySeconds)}</strong><small>на участке</small></div><div className="stat"><span>Маршрут</span><strong>{distanceKm.toFixed(2)} <small>км</small></strong><small>{pointCount} точек GPS</small></div><div className="stat"><span>Пробелы GPS</span><strong>{gapCount}</strong><small>интервалов более 1 мин</small></div><div className="stat"><span>Дефекты</span><strong>{sectionDefects.filter((d) => d.inspection_id === inspection.id).length}</strong><small>отмечено в этом осмотре</small></div><div className="inspector-gps-stat"><div className="inspector-gps-dot"/><div><b>{location.position ? `GPS · ±${Math.round(location.position.accuracy_m)} м` : 'Ожидаем GPS'}</b><small>{location.position ? `${fmtCoord(location.position.lat)}, ${fmtCoord(location.position.lng)}` : location.error || 'Включите геолокацию устройства'}</small></div></div></div>
+          <div className="inspector-metrics"><div className="stat"><span>Время</span><strong>{elapsed(surveySeconds)}</strong><small>на участке</small></div><div className="stat"><span>Маршрут</span><strong>{distanceKm.toFixed(2)} <small>км</small></strong><small>{pointCount} точек GPS</small></div><div className="stat"><span>Пробелы GPS</span><strong>{gapCount}</strong><small>интервалов более 1 мин</small></div><div className="stat"><span>Дефекты</span><strong>{sectionDefects.filter((d) => d.inspection_id === inspection.id).length}</strong><small>отмечено в этом осмотре</small></div><div className="inspector-gps-stat"><div className="inspector-gps-dot"/><div><b>{location.position ? `GPS · ±${Math.round(location.position.accuracy_m)} м` : 'Ожидаем GPS'}</b><small>{location.position ? `${fmtCoord(location.position.lat)}, ${fmtCoord(location.position.lng)}` : location.status === 'reconnecting' ? 'Повторное определение позиции' : location.error || 'Определяем позицию'}</small></div></div></div>
           <div className="inspector-survey-actions"><div><h2>Нашли повреждение?</h2><p className="muted">Добавьте фото и координаты прямо с участка.</p></div><div className="row"><button className="button primary" onClick={() => beginCreate()}><Icon name="plus" size={17}/> Зафиксировать дефект</button><button className="button secondary" onClick={() => setShowFinishConfirm(true)}><Icon name="check" size={17}/> Завершить осмотр</button></div></div>
         </section>}
 
@@ -348,9 +353,9 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
               <div className="inspector-location-map"><MapView section={section} defects={sectionDefects} selectedId={detail?.id} selectedPosition={gps ? {lat:gps.lat,lng:gps.lng} : null} onPosition={(lat,lng) => { if (!location.ready) return; setGps({lat,lng,accuracy_m:null,source:'manual'}); setManualLat(String(lat)); setManualLng(String(lng)); setGpsError(''); }} height={236}/><div className="inspector-location-label"><Icon name={gps?.source === 'gps' ? 'locate' : 'pin'} size={15}/>{gps ? `${gps.source === 'gps' ? 'GPS' : 'Отметка на карте'} · ${fmtCoord(gps.lat)}, ${fmtCoord(gps.lng)}` : 'Нажмите на карту, чтобы поставить точку'}</div></div>
               <div className="inspector-manual-coords"><span className="inspector-or">ИЛИ ВВЕДИТЕ КООРДИНАТЫ</span><div className="inspector-coord-fields"><label className="field"><span>Широта</span><input className="input" inputMode="decimal" placeholder="44.848" value={manualLat} onChange={(e) => setManualLat(e.target.value)}/></label><label className="field"><span>Долгота</span><input className="input" inputMode="decimal" placeholder="65.482" value={manualLng} onChange={(e) => setManualLng(e.target.value)}/></label><button type="button" className="button secondary small" onClick={() => manualCoordinates(manualLat,manualLng)}>Применить</button></div></div>
               {gpsError && <div className="inspector-gps-error">{gpsError}</div>}
-              <button type="button" className="inspector-use-gps" onClick={() => { if (!location.ready || !location.position) return; const fix = {lat:location.position.lat,lng:location.position.lng,accuracy_m:location.position.accuracy_m,source:'gps' as const}; setGps(fix); setManualLat(fmtCoord(fix.lat)); setManualLng(fmtCoord(fix.lng)); setGpsError(''); }}><Icon name="locate" size={16}/> Использовать моё местоположение</button>
+              <button type="button" className="inspector-use-gps" disabled={!location.hasFreshPosition} onClick={() => { if (!location.ready || !location.position) return; const fix = {lat:location.position.lat,lng:location.position.lng,accuracy_m:location.position.accuracy_m,source:'gps' as const}; setGps(fix); setManualLat(fmtCoord(fix.lat)); setManualLng(fmtCoord(fix.lng)); setGpsError(''); }}><Icon name="locate" size={16}/> Использовать моё местоположение</button>
             </div>
-            <div className="inspector-submit-card"><div><b>Проверьте данные</b><span>{photoUploading ? 'Загружаем фото · ' : ''}{photos.length ? `${photos.length} фото · ` : 'Фото не добавлено · '}{gps ? `${gps.source === 'gps' ? 'GPS' : 'ручная точка'}` : 'место не указано'}</span></div><button className="button primary" type="submit" disabled={busy || photoUploading || !gps || !photos.length}>{busy ? 'Отправляем…' : photoUploading ? 'Загрузка фото…' : 'Отправить сообщение'} <Icon name="arrow" size={16}/></button></div>
+            <div className="inspector-submit-card"><div><b>Проверьте данные</b><span>{photoUploading ? 'Загружаем фото · ' : ''}{photos.length ? `${photos.length} фото · ` : 'Фото не добавлено · '}{gps ? `${gps.source === 'gps' ? 'GPS' : 'ручная точка'}` : 'место не указано'}</span></div><button className="button primary" type="submit" disabled={busy || photoUploading || !gps || !photos.length || !location.hasFreshPosition}>{busy ? 'Отправляем…' : photoUploading ? 'Загрузка фото…' : !location.hasFreshPosition ? 'Ожидаем GPS' : 'Отправить сообщение'} <Icon name="arrow" size={16}/></button></div>
           </div></div>
         </form>}
 
