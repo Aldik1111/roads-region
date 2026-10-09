@@ -90,6 +90,91 @@ export const fieldStorage = {
     });
   },
 
+  replaceJob(ownerId: string, oldId: string, next: unknown): Promise<boolean> {
+    return serializeWrite(async () => {
+      const db = await openDatabase();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('records', 'readwrite');
+        const store = tx.objectStore('records');
+        let replaced = false;
+        const oldRequest = store.get([ownerId, `job:${oldId}`]);
+        oldRequest.onsuccess = () => {
+          const old = (oldRequest.result as StoredRow | undefined)?.value as { status?: string } | undefined;
+          if (!old || old.status !== 'rejected') { tx.abort(); return; }
+          const receiptRequest = store.get([ownerId, `receipt:${oldId}`]);
+          receiptRequest.onsuccess = () => {
+            if (receiptRequest.result) { tx.abort(); return; }
+            const nextId = (next as { id: string }).id;
+            const collisionRequest = store.get([ownerId, `job:${nextId}`]);
+            collisionRequest.onsuccess = () => {
+              if (collisionRequest.result) { tx.abort(); return; }
+              store.put({ ownerId, key: `job:${nextId}`, value: next } satisfies StoredRow);
+              store.delete([ownerId, `job:${oldId}`]);
+              replaced = true;
+            };
+          };
+        };
+        tx.oncomplete = () => resolve(replaced);
+        tx.onabort = tx.onerror = () => {
+          if (tx.error) reject(storageError('Не удалось исправить отклонённую операцию.', tx.error));
+          else resolve(false);
+        };
+      });
+    });
+  },
+
+  cleanupConfirmedPhotos(ownerId: string): Promise<{ deleted: number; bytes: number }> {
+    return serializeWrite(async () => {
+      const db = await openDatabase();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('records', 'readwrite');
+        const store = tx.objectStore('records');
+        const range = IDBKeyRange.bound([ownerId, ''], [ownerId, '\uffff']);
+        const request = store.getAll(range);
+        let deleted = 0, bytes = 0;
+        request.onsuccess = () => {
+          const rows = request.result as StoredRow[];
+          const references = new Set<string>();
+          const visit = (value: unknown) => {
+            if (typeof value === 'string') { if (value.startsWith('local-photo-')) references.add(value); return; }
+            if (Array.isArray(value)) { value.forEach(visit); return; }
+            if (value && typeof value === 'object' && !(value instanceof Blob)) Object.values(value).forEach(visit);
+          };
+          for (const row of rows) if (row.key === 'draft' || row.key.startsWith('job:')) visit(row.value);
+          const keys = new Set(rows.map(row => row.key));
+          for (const row of rows) {
+            if (!row.key.startsWith('photo:')) continue;
+            const id = row.key.slice('photo:'.length);
+            if (!keys.has(`remote-photo:${id}`) || references.has(id)) continue;
+            const photo = row.value as { size?: unknown };
+            bytes += Number(photo?.size) || 0;
+            store.delete([ownerId, row.key]);
+            deleted++;
+          }
+        };
+        tx.oncomplete = () => resolve({ deleted, bytes });
+        tx.onabort = tx.onerror = () => reject(storageError('Не удалось очистить подтверждённые фотографии.', tx.error));
+      });
+    });
+  },
+
+  async usage(ownerId: string): Promise<{ bytes: number; browserUsage: number | null; quota: number | null }> {
+    const keys = await this.keys(ownerId, '');
+    let bytes = 0;
+    for (const key of keys) {
+      const value = await this.get<unknown>(ownerId, key);
+      const count = (item: unknown): number => {
+        if (item instanceof Blob) return item.size;
+        if (Array.isArray(item)) return item.reduce((sum, child) => sum + count(child), 0);
+        if (item && typeof item === 'object') return Object.values(item).reduce<number>((sum, child) => sum + count(child), 0);
+        return typeof item === 'string' ? new TextEncoder().encode(item).length : 0;
+      };
+      bytes += count(value);
+    }
+    const estimate = await navigator.storage?.estimate?.().catch(() => undefined);
+    return { bytes, browserUsage: estimate?.usage ?? null, quota: estimate?.quota ?? null };
+  },
+
   increment(ownerId: string, key: string): Promise<number> {
     return serializeWrite(async () => {
       const db = await openDatabase();

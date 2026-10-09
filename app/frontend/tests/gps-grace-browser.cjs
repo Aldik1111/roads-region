@@ -25,7 +25,9 @@ const path=require('node:path');
  await page.route('**/api/**',async r=>{
   const u=new URL(r.request().url()).pathname;
   let body;
-  if(u==='/api/me')body=user;
+  if(u==='/api/health')body={ok:true,demo:true};
+   else if(u==='/api/notifications')body=[];
+   else if(u==='/api/me')body=user;
   else if(u==='/api/bootstrap')body={user,sections:[section],contractors:[],inspectors:[user]};
   else if(u==='/api/inspections')body=[inspection];
   else if(u==='/api/defects')body=[];

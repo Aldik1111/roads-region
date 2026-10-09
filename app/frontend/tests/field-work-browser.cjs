@@ -19,7 +19,9 @@ const assert=require('node:assert/strict');const path=require('node:path');
   await context.route('**/api/**',async r=>{
    if(offline)return r.abort('internetdisconnected');
    const req=r.request(),u=new URL(req.url()).pathname;let body;
-   if(u==='/api/me')body=user;
+   if(u==='/api/health')body={ok:true,demo:true};
+   else if(u==='/api/notifications')body=[];
+   else if(u==='/api/me')body=user;
    else if(u==='/api/bootstrap')body={user,sections:[route],contractors:[],inspectors:[user]};
    else if(u==='/api/inspections')body=[inspection];
    else if(u==='/api/defects'&&req.method()==='GET')body=[...created.values()];

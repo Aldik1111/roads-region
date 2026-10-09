@@ -35,6 +35,32 @@ def iso(value: datetime | None) -> str | None:
     return value.isoformat().replace("+00:00", "Z") if value else None
 
 
+def utc_datetime(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise RuntimeError(f"{name} must be a boolean value")
+
+
+DEMO_MODE = env_bool("ROADS_DEMO_MODE", True)
+REQUIRE_HTTPS = env_bool("ROADS_REQUIRE_HTTPS", False)
+try:
+    REVIEW_HOURS = int(os.getenv("ROADS_REVIEW_HOURS", "48"))
+except ValueError as exc:
+    raise RuntimeError("ROADS_REVIEW_HOURS must be a positive integer") from exc
+if REVIEW_HOURS < 1:
+    raise RuntimeError("ROADS_REVIEW_HOURS must be a positive integer")
+
+
 ROOT = Path(__file__).resolve().parents[1]
 PHOTO_DIR = Path(os.getenv("PHOTO_DIR", str(ROOT / "uploads")))
 PHOTO_DIR.mkdir(parents=True, exist_ok=True)
@@ -100,6 +126,18 @@ class RouteRow(Base):
     duration_s: Mapped[float] = mapped_column(Float, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     preview_id: Mapped[str | None] = mapped_column(ForeignKey("route_previews.id"), unique=True, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    __mapper_args__ = {"version_id_col": version}
+
+
+class RouteEventRow(Base):
+    __tablename__ = "route_events"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    route_id: Mapped[str] = mapped_column(String)
+    recipient_id: Mapped[str] = mapped_column(String)
+    event_type: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class PhotoRow(Base):
@@ -225,6 +263,14 @@ class RoutePublishBody(BaseModel):
     option_id: str | None = None
 
 
+class RouteUpdateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: int
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    notes: str | None = Field(default=None, max_length=2000)
+    inspector_id: str | None = None
+
+
 class DefectBody(BaseModel):
     section_id: str
     inspection_id: str | None = None
@@ -256,16 +302,36 @@ if "routes" in inspect(engine).get_table_names():
     if "duration_s" not in existing_route_columns:
         with engine.begin() as connection:
             connection.exec_driver_sql("ALTER TABLE routes ADD COLUMN duration_s FLOAT NOT NULL DEFAULT 0")
+    if "version" not in existing_route_columns:
+        with engine.begin() as connection:
+            connection.exec_driver_sql("ALTER TABLE routes ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
 Index("uq_inspections_one_active_per_inspector", InspectionRow.inspector_id, unique=True,
       sqlite_where=text("status = 'active'"), postgresql_where=text("status = 'active'")).create(engine, checkfirst=True)
 
 
-def db_dep():
+def db_dep(request: Request):
     db = SessionLocal()
     try:
+        route_path = request.url.path.split("?")[0]
+        serialized_route_mutation = (
+            request.method == "POST" and route_path == "/api/inspections"
+        ) or (
+            request.method == "PATCH"
+            and route_path.startswith("/api/routes/")
+            and len(route_path.strip("/").split("/")) == 3
+        )
+        if engine.dialect.name == "sqlite" and serialized_route_mutation:
+            # Acquire SQLite's writer reservation before auth or endpoint reads.
+            # This serializes route reassignment with inspection creation across
+            # separate processes/connections, unlike an in-process mutex.
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         yield db
     finally:
         db.close()
+
+
+def lock_route_for_update(db: Session, route_id: str) -> RouteRow | None:
+    return db.scalar(select(RouteRow).where(RouteRow.id == route_id).with_for_update())
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -339,7 +405,7 @@ def route_data(row: RouteRow, db: Session) -> dict:
         "geometry": row.geometry, "responsible": "Демо: Кызылординский областной филиал" if row.is_demo else (inspector.name if inspector else ""),
         "is_demo": row.is_demo, "inspector_id": row.inspector_id, "inspector_name": inspector.name if inspector else "",
         "notes": row.notes or "", "created_at": iso(row.created_at), "state": state, "duration_min": duration_min, "duration_s": float(row.duration_s or 0),
-        "source": row.source, "start": row.start, "end": row.end,
+        "source": row.source, "start": row.start, "end": row.end, "version": row.version,
     }
 
 
@@ -352,6 +418,14 @@ def routes_visible_to(user: UserRow, db: Session) -> list[RouteRow]:
         assigned_sections = select(DefectRow.section_id).where(DefectRow.contractor_id == user.contractor_id).distinct()
         return db.scalars(select(RouteRow).where(RouteRow.id.in_(assigned_sections)).order_by(RouteRow.created_at, RouteRow.code)).all()
     return []
+
+
+def contractor_users(db: Session) -> list[UserRow]:
+    rows = db.scalars(select(UserRow).where(UserRow.role == "contractor", UserRow.contractor_id.is_not(None)).order_by(UserRow.name)).all()
+    unique: dict[str, UserRow] = {}
+    for row in rows:
+        unique.setdefault(row.contractor_id, row)
+    return list(unique.values())
 
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -484,7 +558,17 @@ def defect_data(row: DefectRow, db: Session, detail: bool = False) -> dict:
     due_at = row.due_at
     if due_at and due_at.tzinfo is None:
         due_at = due_at.replace(tzinfo=timezone.utc)
-    result = {"id": row.id, "number": row.number, "section_id": row.section_id, "section_name": section.name if section else None, "section_code": section.code if section else None, "inspection_id": row.inspection_id, "type": row.type, "description": row.description, "status": row.status, "lat": row.lat, "lng": row.lng, "location_source": row.location_source, "accuracy_m": row.accuracy_m, "observed_at": iso(row.observed_at), "received_at": iso(row.received_at), "inspector_id": row.inspector_id, "contractor_id": row.contractor_id, "contractor_name": contractor.name if contractor else None, "due_at": iso(due_at), "overdue": bool(due_at and due_at < utcnow() and row.status not in ("closed", "cancelled")), "version": row.version, "photos": photos, "previous_defect_id": row.previous_defect_id, "duplicate_of_id": row.duplicate_of_id}
+    latest_repair = (row.repairs or [])[-1] if row.repairs else {}
+    review_due_at = latest_repair.get("review_due_at") if isinstance(latest_repair, dict) else None
+    review_due_dt = None
+    if isinstance(review_due_at, str):
+        try:
+            review_due_dt = datetime.fromisoformat(review_due_at.replace("Z", "+00:00"))
+            if review_due_dt.tzinfo is None:
+                review_due_dt = review_due_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            review_due_dt = None
+    result = {"id": row.id, "number": row.number, "section_id": row.section_id, "section_name": section.name if section else None, "section_code": section.code if section else None, "inspection_id": row.inspection_id, "type": row.type, "description": row.description, "status": row.status, "lat": row.lat, "lng": row.lng, "location_source": row.location_source, "accuracy_m": row.accuracy_m, "observed_at": iso(row.observed_at), "received_at": iso(row.received_at), "inspector_id": row.inspector_id, "contractor_id": row.contractor_id, "contractor_name": contractor.name if contractor else None, "due_at": iso(due_at), "overdue": bool(due_at and due_at < utcnow() and row.status not in ("closed", "cancelled")), "review_due_at": iso(review_due_dt), "review_overdue": bool(review_due_dt and review_due_dt < utcnow() and row.status == "review"), "version": row.version, "photos": photos, "previous_defect_id": row.previous_defect_id, "duplicate_of_id": row.duplicate_of_id}
     if detail:
         result["history"] = row.history or []
         repairs = []
@@ -605,7 +689,8 @@ def seed():
         db.commit()
 
 
-seed()
+if DEMO_MODE:
+    seed()
 
 
 def ensure_legacy_route():
@@ -626,7 +711,8 @@ def ensure_legacy_route():
         db.commit()
 
 
-ensure_legacy_route()
+if DEMO_MODE:
+    ensure_legacy_route()
 
 
 @app.exception_handler(HTTPException)
@@ -647,6 +733,8 @@ def me(user: UserRow = Depends(current_user)):
 
 @app.post("/api/login")
 def login(body: LoginBody, request: Request, response: Response, db: Session = Depends(db_dep)):
+    if REQUIRE_HTTPS and request.url.scheme != "https":
+        raise HTTPException(400, detail={"code": "HTTPS_REQUIRED", "message": "Для входа требуется защищённое HTTPS-соединение"})
     user = db.scalar(select(UserRow).where(UserRow.email == body.email.lower()))
     if not user or not check_password(body.password, user.password_hash):
         raise HTTPException(401, detail={"code": "INVALID_CREDENTIALS", "message": "Неверный email или пароль"})
@@ -676,7 +764,7 @@ def bootstrap(user: UserRow = Depends(current_user), db: Session = Depends(db_de
         "user": user_data(user),
         "sections": [route_data(row, db) for row in routes_visible_to(user, db)],
         "inspectors": inspectors,
-        "contractors": [{"id": "c-1", "name": "Кызылорда ЖолСервис"}, {"id": "c-2", "name": "ДорСтрой Сырдарья"}],
+        "contractors": [{"id": item.contractor_id, "name": item.name} for item in contractor_users(db)],
     }
 
 
@@ -782,7 +870,7 @@ def get_photo(photo_id: str, user: UserRow = Depends(current_user), db: Session 
 @app.post("/api/inspections")
 def create_inspection(body: InspectionBody, user: UserRow = Depends(current_user), db: Session = Depends(db_dep)):
     require_role(user, "inspector")
-    route = db.get(RouteRow, body.section_id)
+    route = lock_route_for_update(db, body.section_id)
     if not route or route.inspector_id != user.id:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "Маршрут не назначен этому инспектору"})
     active = db.scalar(select(InspectionRow).where(
@@ -947,7 +1035,7 @@ def defect_action(defect_id: str, body: ActionBody, user: UserRow = Depends(curr
         require_role(user, "dispatcher")
         if row.status != "new": raise HTTPException(409, detail={"code": "ILLEGAL_TRANSITION", "message": "Назначить можно только новый дефект"})
         target = p.get("contractor_id")
-        if target not in ("c-1", "c-2"): raise HTTPException(422, detail={"code": "INVALID_CONTRACTOR", "message": "Выберите подрядчика"})
+        if not db.scalar(select(UserRow.id).where(UserRow.role == "contractor", UserRow.contractor_id == target)): raise HTTPException(422, detail={"code": "INVALID_CONTRACTOR", "message": "Выберите подрядчика"})
         row.contractor_id = target; row.due_at = required_datetime("due_at"); row.status = "assigned"
     elif action == "request_info":
         require_role(user, "dispatcher"); require_text("comment")
@@ -968,7 +1056,8 @@ def defect_action(defect_id: str, body: ActionBody, user: UserRow = Depends(curr
             if not photo_ids: raise HTTPException(422, detail={"code": "PHOTO_REQUIRED", "message": "Добавьте фото выполненных работ"})
             pics = [db.get(PhotoRow, pid) for pid in photo_ids]
             if any(not x or x.owner_id != user.id for x in pics): raise HTTPException(403, detail={"code": "PHOTO_FORBIDDEN", "message": "Можно использовать только собственные загруженные фото"})
-            row.repairs = [*(row.repairs or []), {"id": str(uuid.uuid4()), "created_at": iso(utcnow()), "comment": p["comment"].strip(), "photos": list(dict.fromkeys(photo_ids)), "decision": None, "decision_comment": None}]
+            submitted_at = utcnow()
+            row.repairs = [*(row.repairs or []), {"id": str(uuid.uuid4()), "created_at": iso(submitted_at), "review_due_at": iso(submitted_at + timedelta(hours=REVIEW_HOURS)), "comment": p["comment"].strip(), "photos": list(dict.fromkeys(photo_ids)), "decision": None, "decision_comment": None}]
         if action == "report_assignment": require_text("reason")
         row.status = target
     elif action in ("approve", "reject"):
@@ -991,6 +1080,17 @@ def defect_action(defect_id: str, body: ActionBody, user: UserRow = Depends(curr
                 repair["review_evidence"] = validate_review_evidence(raw_evidence, row, user, db)
             row.status = "rework"; repair["decision"] = "rejected"; repair["decision_comment"] = decision_comment
         row.repairs = [*(row.repairs or [])[:-1], repair]
+    elif action == "change_review_deadline":
+        require_role(user, "dispatcher")
+        if row.status != "review" or not row.repairs or not isinstance(row.repairs[-1], dict):
+            raise HTTPException(409, detail={"code": "ILLEGAL_TRANSITION", "message": "Срок проверки можно изменить только для отправленного ремонта"})
+        require_text("reason")
+        new_due = required_datetime("review_due_at")
+        if new_due <= utcnow():
+            raise HTTPException(422, detail={"code": "INVALID_REVIEW_DEADLINE", "message": "Срок проверки должен быть в будущем"})
+        repairs = [*row.repairs]
+        latest = dict(repairs[-1]); latest["review_due_at"] = iso(new_due)
+        repairs[-1] = latest; row.repairs = repairs
     elif action in ("reassign", "change_deadline"):
         require_role(user, "dispatcher")
         valid = {"reassign": ("assigned", "accepted", "in_progress", "rework"), "change_deadline": ("assigned", "accepted", "in_progress", "review", "rework")}[action]
@@ -998,7 +1098,7 @@ def defect_action(defect_id: str, body: ActionBody, user: UserRow = Depends(curr
         require_text("reason")
         if action == "reassign":
             target = p.get("contractor_id")
-            if target not in ("c-1", "c-2"): raise HTTPException(422, detail={"code": "INVALID_CONTRACTOR", "message": "Выберите подрядчика"})
+            if not db.scalar(select(UserRow.id).where(UserRow.role == "contractor", UserRow.contractor_id == target)): raise HTTPException(422, detail={"code": "INVALID_CONTRACTOR", "message": "Выберите подрядчика"})
             row.contractor_id = target; row.status = "assigned"
         row.due_at = required_datetime("due_at")
     elif action == "cancel":
@@ -1027,7 +1127,7 @@ def defect_action(defect_id: str, body: ActionBody, user: UserRow = Depends(curr
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "database": "postgresql" if DATABASE_URL.startswith("postgres") else "sqlite", "demo": True}
+    return {"ok": True, "database": "postgresql" if DATABASE_URL.startswith("postgres") else "sqlite", "demo": DEMO_MODE}
 
 
 @app.post("/api/routes/preview")
@@ -1134,6 +1234,126 @@ def publish_route(body: RoutePublishBody, user: UserRow = Depends(current_user),
 @app.get("/api/routes")
 def get_routes(user: UserRow = Depends(current_user), db: Session = Depends(db_dep)):
     return [route_data(row, db) for row in routes_visible_to(user, db)]
+
+
+@app.patch("/api/routes/{route_id}")
+def update_route(route_id: str, body: RouteUpdateBody, user: UserRow = Depends(current_user), db: Session = Depends(db_dep)):
+    require_role(user, "dispatcher")
+    route = lock_route_for_update(db, route_id)
+    if not route:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "Маршрут не найден"})
+    if route.version != body.version:
+        raise HTTPException(409, detail={"code": "CONFLICT", "message": "Маршрут уже изменён. Обновите страницу", "details": {"version": route.version}})
+    if body.name is None and body.notes is None and body.inspector_id is None:
+        raise HTTPException(422, detail={"code": "EMPTY_UPDATE", "message": "Укажите поле для изменения"})
+    if body.name is not None and not body.name.strip():
+        raise HTTPException(422, detail={"code": "INVALID_NAME", "message": "Название маршрута не может быть пустым"})
+    new_inspector = None
+    if body.inspector_id is not None:
+        new_inspector = db.get(UserRow, body.inspector_id)
+        if not new_inspector or new_inspector.role != "inspector":
+            raise HTTPException(422, detail={"code": "INVALID_INSPECTOR", "message": "Выберите действующего инспектора"})
+        if body.inspector_id != route.inspector_id:
+            active = db.scalar(select(InspectionRow.id).where(InspectionRow.section_id == route.id, InspectionRow.status == "active").limit(1))
+            if active:
+                raise HTTPException(409, detail={"code": "ACTIVE_INSPECTION", "message": "Нельзя переназначить маршрут во время активного осмотра"})
+    old_inspector_id = route.inspector_id
+    if body.name is not None:
+        route.name = body.name.strip()
+    if body.notes is not None:
+        route.notes = body.notes.strip()
+    if new_inspector is not None:
+        route.inspector_id = new_inspector.id
+        if new_inspector.id != old_inspector_id:
+            db.add(RouteEventRow(id=str(uuid.uuid4()), route_id=route.id, recipient_id=new_inspector.id, event_type="route_assigned", created_at=utcnow(), payload={"route_name": route.name, "actor_name": user.name}))
+    try:
+        db.commit()
+    except StaleDataError:
+        db.rollback()
+        latest = db.get(RouteRow, route_id)
+        raise HTTPException(409, detail={"code": "CONFLICT", "message": "Маршрут изменён одновременно. Обновите страницу", "details": {"version": latest.version if latest else None}})
+    db.refresh(route)
+    return route_data(route, db)
+
+
+@app.get("/api/notifications")
+def notifications(user: UserRow = Depends(current_user), db: Session = Depends(db_dep)):
+    items: list[dict] = []
+    if user.role == "inspector":
+        events = db.scalars(select(RouteEventRow).where(RouteEventRow.recipient_id == user.id, RouteEventRow.event_type == "route_assigned").order_by(RouteEventRow.created_at.desc())).all()
+        for event in events:
+            items.append({"id": f"route-assigned:{event.id}", "type": "route_assigned", "title": "Назначен маршрут", "message": event.payload.get("route_name", "Маршрут"), "created_at": iso(event.created_at), "href": f"/routes/{event.route_id}", "route_id": event.route_id})
+    defect_rows = db.scalars(select(DefectRow)).all()
+    for row in defect_rows:
+        repair = (row.repairs or [])[-1] if row.repairs else {}
+        repair_id = repair.get("id") if isinstance(repair, dict) else None
+        history = row.history or []
+        if row.status == "review" and repair_id:
+            submitted = next((entry for entry in reversed(history) if entry.get("action") == "submit"), None)
+            recipients = user.role == "dispatcher" or (user.role == "inspector" and row.inspector_id == user.id)
+            if submitted and recipients:
+                items.append({"id": f"repair-submitted:{row.id}:{repair_id}", "type": "repair_submitted", "title": "Ремонт ожидает проверки", "message": f"{row.number}: {row.type}", "created_at": submitted.get("created_at"), "href": f"/defects/{row.id}", "defect_id": row.id, "number": row.number})
+            due = repair.get("review_due_at") if isinstance(repair, dict) else None
+            try:
+                due_dt = datetime.fromisoformat(due.replace("Z", "+00:00")) if due else None
+            except (ValueError, AttributeError):
+                due_dt = None
+            if due_dt:
+                due_dt = utc_datetime(due_dt)
+            if due_dt and due_dt < utcnow() and (user.role == "dispatcher" or (user.role == "inspector" and row.inspector_id == user.id)):
+                items.append({"id": f"review-overdue:{row.id}:{repair_id}", "type": "review_overdue", "title": "Просрочена проверка ремонта", "message": f"{row.number}: {row.type}", "created_at": iso(due_dt), "href": f"/defects/{row.id}", "defect_id": row.id, "number": row.number})
+        if row.status == "rework" and repair_id and isinstance(repair, dict) and repair.get("decision") == "rejected":
+            rejected = next((entry for entry in reversed(history) if entry.get("action") == "reject"), None)
+            if rejected and user.role == "contractor" and row.contractor_id == user.contractor_id:
+                items.append({"id": f"repair-rejected:{row.id}:{repair_id}", "type": "repair_rejected", "title": "Ремонт отправлен на доработку", "message": f"{row.number}: {repair.get('decision_comment') or row.type}", "created_at": rejected.get("created_at"), "href": f"/defects/{row.id}", "defect_id": row.id, "number": row.number})
+    items.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return items[:100]
+
+
+@app.get("/api/reports/contractors")
+def contractor_report(user: UserRow = Depends(current_user), db: Session = Depends(db_dep)):
+    require_role(user, "dispatcher")
+    contractors = contractor_users(db)
+    defects = db.scalars(select(DefectRow)).all()
+    now = utcnow()
+    reports = []
+    for contractor in contractors:
+        rows = [row for row in defects if row.contractor_id == contractor.contractor_id]
+        durations = []
+        for row in rows:
+            if row.status != "closed":
+                continue
+            history = [entry for entry in (row.history or []) if isinstance(entry, dict)]
+            submit_index = next((index for index in range(len(history) - 1, -1, -1) if history[index].get("action") == "submit"), None)
+            start_index = next((index for index in range(submit_index - 1, -1, -1) if history[index].get("action") == "start"), None) if submit_index is not None else None
+            approval_index = next((index for index in range(len(history) - 1, -1, -1) if history[index].get("action") == "approve"), None)
+            if submit_index is None or start_index is None or approval_index is None or approval_index <= submit_index:
+                continue
+            if any(entry.get("action") in ("submit", "reject", "approve") for entry in history[start_index + 1:submit_index]):
+                continue
+            try:
+                start_text = history[start_index].get("created_at")
+                submit_text = history[submit_index].get("created_at")
+                start = utc_datetime(datetime.fromisoformat(start_text.replace("Z", "+00:00"))) if isinstance(start_text, str) else None
+                end = utc_datetime(datetime.fromisoformat(submit_text.replace("Z", "+00:00"))) if isinstance(submit_text, str) else None
+                if start and end and end >= start:
+                    durations.append((end - start).total_seconds() / 3600)
+            except (ValueError, TypeError, KeyError):
+                pass
+        overdue_count = 0
+        for row in rows:
+            if row.status in ("closed", "cancelled"):
+                continue
+            deadline_overdue = bool(row.due_at and utc_datetime(row.due_at) < now)
+            latest = (row.repairs or [])[-1] if row.repairs else {}
+            review_due = latest.get("review_due_at") if isinstance(latest, dict) else None
+            try:
+                review_due_dt = utc_datetime(datetime.fromisoformat(review_due.replace("Z", "+00:00"))) if review_due else None
+            except (ValueError, AttributeError):
+                review_due_dt = None
+            overdue_count += bool(deadline_overdue or (row.status == "review" and review_due_dt and review_due_dt < now))
+        reports.append({"contractor_id": contractor.contractor_id, "name": contractor.name, "total": len(rows), "completed": sum(row.status == "closed" for row in rows), "rework": sum(row.status == "rework" for row in rows), "overdue": overdue_count, "average_repair_hours": round(sum(durations) / len(durations), 1) if durations else None})
+    return reports
 
 
 @app.get("/api/routes/{route_id}/results")

@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { api, ApiError } from './api';
 import { History, MapView, PhotoGallery, StatusBadge, formatDate, UploadField } from './components';
+import ReviewDeadline from './ReviewDeadline';
+import type {WorkTarget} from './types';
 import { ReviewEvidenceView } from './RepairReview';
 import type { Bootstrap, Contractor, Defect, DefectDetail, Section, User } from './types';
 import './operations.css';
 
-type Props = { user: User };
+type Props = { user: User; target?:WorkTarget };
 type Notice = { kind: 'error' | 'success' | 'warning'; text: string } | null;
 type Panel = 'list' | 'map' | 'detail';
 type DispatcherDialogKind = 'request' | 'cancel' | 'reassign' | 'deadline' | 'duplicates';
@@ -25,16 +27,17 @@ const errorText = (error: unknown) => error instanceof ApiError ? error.message 
 const statusCaption: Record<string, string> = { new: 'Новые', needs_info: 'Нужны сведения', assigned: 'Назначены', accepted: 'Приняты', in_progress: 'В работе', review: 'На проверке', rework: 'На доработке', closed: 'Закрыты', cancelled: 'Отменены' };
 const routeLabel = (section?: Section | null) => section ? `${section.code} · ${section.name}` : 'Маршрут не найден';
 
-export default function Operations({ user }: Props) {
-  return user.role === 'contractor' ? <ContractorWorkspace user={user} /> : <DispatcherWorkspace user={user} />;
+export default function Operations({ user,target }: Props) {
+  return user.role === 'contractor' ? <ContractorWorkspace user={user} target={target}/> : <DispatcherWorkspace user={user} target={target}/>;
 }
 
-function DispatcherWorkspace({ user }: Props) {
+function DispatcherWorkspace({ user,target }: Props) {
   const [defects, setDefects] = useState<Defect[]>([]);
   const [sections, setSections] = useState<Section[]>([]);
   const [routeFilter, setRouteFilter] = useState('all');
   const [contractors, setContractors] = useState<Contractor[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(target?.defectId??null);
+  useEffect(()=>{if(target?.defectId){setSelectedId(target.defectId);setPanel('detail')}},[target?.nonce]);
   const [detail, setDetail] = useState<DefectDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -144,6 +147,7 @@ function DispatcherDetail({ detail, section, contractors, onAction, onOpenDialog
   useEffect(() => { setContractorId(detail.contractor_id ?? ''); setDueAt(localInput(detail.due_at) || dateInThreeDays()); }, [detail.id, detail.contractor_id, detail.due_at]);
   return <>
     <div className="ops-detail-header"><div><div className="section-label">КАРТОЧКА ОБРАЩЕНИЯ</div><div className="ops-detail-number">№ {detail.number}</div></div><StatusBadge status={detail.status} overdue={detail.overdue} /></div>
+    <ReviewDeadline defect={detail} onChange={onAction} busy={busy}/>
     <h2 className="ops-defect-title">{detail.type}</h2><p className="ops-defect-description">{detail.description}</p>
     <div className="ops-facts"><Fact label="Маршрут" value={routeLabel(section)} /><Fact label="Обнаружено" value={formatDate(detail.observed_at)} /><Fact label="Получено" value={formatDate(detail.received_at)} /><Fact label="Исполнитель" value={detail.contractor_name ?? 'Не назначен'} /><Fact label="Срок" value={detail.due_at ? formatDate(detail.due_at) : 'Не установлен'} /></div>
     <div className="ops-coordinate"><div><span className="section-label">КООРДИНАТЫ</span><strong>{detail.lat.toFixed(6)}°, {detail.lng.toFixed(6)}°</strong><span>{detail.location_source === 'gps' ? 'GPS' : 'Указано вручную'}{detail.accuracy_m != null ? ` · точность ±${Math.round(detail.accuracy_m)} м` : ''}</span></div><span className="ops-pin">⌖</span></div>
@@ -174,11 +178,12 @@ function DispatcherDialog({ kind, detail, contractors, initialContractorId, init
   </section></div>;
 }
 
-function ContractorWorkspace({ user }: Props) {
+function ContractorWorkspace({ user,target }: Props) {
   const [defects, setDefects] = useState<Defect[]>([]);
   const [sections, setSections] = useState<Section[]>([]);
   const [detail, setDetail] = useState<DefectDetail | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(target?.defectId??null);
+  useEffect(()=>{if(target?.defectId){setSelectedId(target.defectId);setPanel('detail')}},[target?.nonce]);
   const [routeFilter, setRouteFilter] = useState('all');
   const [photos, setPhotos] = useState<DefectDetail['photos']>([]);
   const [repairPhotoUploading, setRepairPhotoUploading] = useState(false);
@@ -223,6 +228,7 @@ function ContractorWorkspace({ user }: Props) {
         {detail.status === 'accepted' && <div className="ops-action-panel"><div><span className="section-label">СЛЕДУЮЩИЙ ШАГ</span><strong>Начните ремонт, когда будете на месте</strong></div><button className="button primary" disabled={busy} onClick={() => void action('start')}>{busy ? 'Обновляем…' : 'Начать ремонт'}</button></div>}
         {detail.status === 'rework' && <div className="ops-action-panel"><div><span className="section-label">ПОВТОРНЫЙ РЕМОНТ</span><strong>Создайте новую попытку по замечанию инспектора</strong></div><button className="button primary" disabled={busy} onClick={() => void action('start')}>{busy ? 'Обновляем…' : 'Начать доработку'}</button></div>}
         {detail.status === 'in_progress' && <div className="ops-action-panel ops-submit-panel"><div><span className="section-label">ОТЧЁТ О РЕМОНТЕ</span><strong>Загрузите новые фотографии после ремонта</strong><span>Фотографии и комментарий обязательны. Исходные фото обращения сохраняются отдельно.</span></div><UploadField photos={photos} onChange={setPhotos} onBusyChange={setRepairPhotoUploading} label="Фотографии ремонта" /><label className="field">Комментарий о выполненных работах<textarea className="textarea" required minLength={2} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Что было сделано?" /></label><button className="button primary" disabled={busy || repairPhotoUploading || photos.length === 0 || comment.trim().length < 2} onClick={() => void action('submit', { photo_ids: photos.map((p) => p.id), comment: comment.trim() })}>{busy ? 'Отправляем…' : 'Передать инспектору'}</button></div>}
+        {detail.status === 'review' && <ReviewDeadline defect={detail}/>}
         {detail.status === 'review' && <div className="ops-readonly"><span>◷</span><div><strong>Отчёт отправлен инспектору</strong><p>Карточка доступна для просмотра, новые действия появятся после решения инспектора.</p></div></div>}
         {['closed', 'cancelled', 'needs_info', 'new'].includes(detail.status) && <div className="ops-readonly"><span>i</span><div><strong>{detail.status === 'closed' ? 'Работа завершена' : detail.status === 'cancelled' ? 'Обращение отменено' : 'Ожидает решения диспетчера'}</strong><p>Действия в этой карточке сейчас недоступны.</p></div></div>}
         <div className="ops-detail-section"><div className="section-label">ИСТОРИЯ ДЕЙСТВИЙ</div><History events={detail.history} /></div>

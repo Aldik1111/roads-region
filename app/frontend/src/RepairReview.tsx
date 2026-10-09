@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, Check, CheckCircle2, MapPin, ShieldCheck, WifiOff } from 'lucide-react';
-import { formatDate, PhotoGallery, UploadField } from './components';
+import { formatDate, UploadField } from './components';
 import { useDeviceLocation } from './geolocation';
 import type { DefectDetail, Photo, Repair } from './types';
 import './repair-review.css';
+import PhotoGallery from './PhotoViewer';
 
 type Props = {
   detail: DefectDetail;

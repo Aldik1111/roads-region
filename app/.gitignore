@@ -13,3 +13,5 @@ work/
 logs/
 *.pid
 .phone-test/
+.env.production
+backups/

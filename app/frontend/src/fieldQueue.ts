@@ -3,7 +3,8 @@ import type { Photo } from './types';
 import { fieldStorage, withFieldQueueLock } from './fieldStorage';
 
 export type FieldJobKind = 'defect' | 'points' | 'finish';
-export type FieldJobStatus = 'pending' | 'sending' | 'error';
+export type FieldJobStatus = 'pending' | 'sending' | 'error' | 'rejected';
+export type FieldJobErrorClass = 'ambiguous' | 'validation-rejected' | 'photo-upload' | 'other';
 export type FieldJob = {
   id: string;
   kind: FieldJobKind;
@@ -11,6 +12,9 @@ export type FieldJob = {
   body: Record<string, unknown>;
   status: FieldJobStatus;
   error?: string;
+  errorCode?: string;
+  errorStatus?: number;
+  errorClass?: FieldJobErrorClass;
   createdAt: string;
   order: number;
 };
@@ -107,7 +111,7 @@ export async function stageFieldPhoto(ownerId: string, file: File): Promise<Phot
   const id = `local-photo-${uuid()}`;
   const preview = await readAsDataUrl(new File([file], file.name, { type: actualType, lastModified: file.lastModified }));
   const staged: StagedPhoto = { file, name: file.name, type: actualType, size: file.size, createdAt: new Date().toISOString() };
-  await fieldStorage.set(ownerId, `photo:${id}`, staged);
+  await withFieldQueueLock(`enqueue:${ownerId}`, async () => { await fieldStorage.set(ownerId, `photo:${id}`, staged); emit(ownerId); });
   return { id, url: preview, name: file.name };
 }
 
@@ -162,7 +166,13 @@ async function resolvedDefectBody(ownerId: string, body: Record<string, unknown>
     if (!staged) throw new Error(`Не найден сохранённый файл ${value}. Операция оставлена в очереди.`);
     const file = new File([staged.file], staged.name, { type: staged.type, lastModified: Date.parse(staged.createdAt) || Date.now() });
     await verifiedOwner(ownerId);
-    const remote = await upload(file, value, ownerId);
+    let remote: Photo;
+    try { remote = await upload(file, value, ownerId); }
+    catch (failure) {
+      const error = failure instanceof Error ? failure : new Error('Не удалось загрузить фотографию.');
+      error.name = 'FieldPhotoUploadError';
+      throw error;
+    }
     if (!remote?.id || !remote.url) throw new Error('Сервер не подтвердил загрузку фотографии. Операция оставлена в очереди.');
     // Persist the stable upload result before posting the defect so retries do not create another file.
     await fieldStorage.set(ownerId, `remote-photo:${value}`, remote);
@@ -190,7 +200,8 @@ export async function flushFieldQueue(ownerId: string): Promise<void> {
     const jobs = await listFieldJobs(ownerId);
     if (!jobs.length) return;
     for (const original of jobs) {
-      const job: FieldJob = { ...original, status: 'sending', error: undefined };
+      if (original.status === 'rejected') throw new Error('Исправьте отклонённое сообщение перед продолжением очереди.');
+      const job: FieldJob = { ...original, status: 'sending', error: undefined, errorCode: undefined, errorStatus: undefined, errorClass: undefined };
       await fieldStorage.set(ownerId, `job:${job.id}`, job);
       emit(ownerId);
       try {
@@ -203,10 +214,46 @@ export async function flushFieldQueue(ownerId: string): Promise<void> {
         emit(ownerId);
       } catch (failure) {
         const message = (failure as Error)?.message || 'Сервер не подтвердил операцию. Она сохранена для повтора.';
-        await fieldStorage.set(ownerId, `job:${job.id}`, { ...job, status: 'error', error: message });
+        const errorCode = String((failure as { code?: unknown })?.code ?? (failure as Error)?.name ?? 'UNKNOWN');
+        const rawStatus = Number((failure as { status?: unknown })?.status ?? errorCode);
+        const errorStatus = Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus <= 599 ? rawStatus : undefined;
+        const photoUpload = (failure as Error)?.name === 'FieldPhotoUploadError';
+        const validationRejected = !photoUpload && (errorStatus === 400 || errorStatus === 422);
+        const errorClass: FieldJobErrorClass = photoUpload ? 'photo-upload' : validationRejected ? 'validation-rejected' : errorStatus === undefined ? 'ambiguous' : 'other';
+        await fieldStorage.set(ownerId, `job:${job.id}`, { ...job, status: validationRejected && job.kind === 'defect' ? 'rejected' : 'error', error: message, errorCode, errorStatus, errorClass });
         emit(ownerId);
         throw failure;
       }
     }
   });
+}
+
+export async function reviseRejectedFieldJob(ownerId: string, jobId: string, changes: { type?: string; description?: string }): Promise<string> {
+  if (!ownerId || !jobId || !changes || Object.keys(changes).some(key => key !== 'type' && key !== 'description')) throw new Error('Можно исправить только тип и описание отклонённого сообщения.');
+  return withFieldQueueLock(ownerId, () => withFieldQueueLock(`enqueue:${ownerId}`, async () => {
+    const old = await fieldStorage.get<FieldJob>(ownerId, `job:${jobId}`);
+    const receipt = await fieldStorage.get<QueueReceipt>(ownerId, `receipt:${jobId}`);
+    if (!old || receipt || old.kind !== 'defect' || old.status !== 'rejected' || old.errorClass !== 'validation-rejected' || ![400, 422].includes(old.errorStatus ?? 0)) {
+      throw new Error('Операция не имеет подтверждённого исправимого отказа сервера.');
+    }
+    const nextId = uuid();
+    const next: FieldJob = {
+      ...old,
+      id: nextId,
+      body: { ...old.body, ...(changes.type !== undefined ? { type: changes.type } : {}), ...(changes.description !== undefined ? { description: changes.description } : {}) },
+      status: 'pending', error: undefined, errorCode: undefined, errorStatus: undefined, errorClass: undefined,
+    };
+    if (!await fieldStorage.replaceJob(ownerId, jobId, next)) throw new Error('Операция уже изменилась или подтверждена. Обновите очередь.');
+    emit(ownerId);
+    return nextId;
+  }));
+}
+
+export async function cleanupConfirmedFieldPhotos(ownerId: string): Promise<{ deleted: number; bytes: number }> {
+  if (!ownerId) throw new Error('Не определён владелец очереди.');
+  return withFieldQueueLock(ownerId, () => withFieldQueueLock(`enqueue:${ownerId}`, async () => {
+    const result = await fieldStorage.cleanupConfirmedPhotos(ownerId);
+    if (result.deleted) emit(ownerId);
+    return result;
+  }));
 }

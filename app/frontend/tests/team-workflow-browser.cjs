@@ -1,0 +1,59 @@
+// API writes are intercepted; this scenario does not change live records.
+const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const assert=require('node:assert/strict');const fs=require('node:fs');const path=require('node:path');
+const PNG=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
+(async()=>{const browser=await chromium.launch({channel:'chrome',headless:true});try{for(const width of [1440,390]){
+ const context=await browser.newContext({viewport:{width,height:900},timezoneId:'UTC',permissions:['geolocation'],geolocation:{latitude:44.85,longitude:65.48,accuracy:8}});const page=await context.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ const user={id:'dispatch-test',name:'Диспетчер',email:'d@example.invalid',role:'dispatcher'};
+ const inspectors=[{id:'inspector-a',name:'Инспектор А',role:'inspector'},{id:'inspector-b',name:'Инспектор Б',role:'inspector'}];
+ let route={id:'route-test',version:1,code:'T-01',name:'Тестовый маршрут',inspector_id:inspectors[0].id,inspector_name:inspectors[0].name,notes:'',state:'assigned',geometry:{type:'LineString',coordinates:[[65.48,44.85],[65.49,44.86]]},length_km:1.4,duration_min:5,created_at:new Date().toISOString(),source:'demo',start:{lat:44.85,lng:65.48},end:{lat:44.86,lng:65.49}};let patched=0,reviewActionBody=null;
+ let defect={id:'defect-test',number:'D-01',section_id:route.id,inspection_id:null,type:'Выбоина',description:'Проверка срока ремонта',status:'review',lat:44.85,lng:65.48,location_source:'gps',accuracy_m:8,observed_at:new Date().toISOString(),received_at:new Date().toISOString(),inspector_id:inspectors[0].id,contractor_id:'c1',contractor_name:'Тестовый подрядчик',due_at:null,overdue:false,review_due_at:'2030-01-01T12:00:00Z',review_overdue:false,version:7,photos:[],previous_defect_id:null,duplicate_of_id:null,repairs:[{id:'repair-1',created_at:new Date().toISOString(),review_due_at:'2030-01-01T12:00:00Z',comment:'Сдано',photos:[],decision:null,decision_comment:null}],history:[]};
+ await page.route('https://tile.openstreetmap.org/**',r=>r.fulfill({contentType:'image/png',body:PNG}));
+ await page.route('**/api/**',async r=>{const req=r.request(),u=new URL(req.url()).pathname;let body;
+  if(u==='/api/health')body={ok:true,demo:false};else if(u==='/api/me')body=user;
+  else if(u==='/api/bootstrap')body={user,sections:[route],inspectors,contractors:[]};
+  else if(u==='/api/defects'&&req.method()==='GET')body=[defect];
+  else if(u==='/api/defects/defect-test'&&req.method()==='GET')body=defect;
+  else if(u==='/api/defects/defect-test/actions'&&req.method()==='POST'){reviewActionBody=req.postDataJSON();defect={...defect,version:defect.version+1,review_due_at:reviewActionBody.payload.review_due_at};body=defect;}
+  else if(u==='/api/routes')body=[route];
+  else if(u==='/api/routes/route-test/results')body={route,inspections:[],defects:[]};
+  else if(u==='/api/routes/route-test'&&req.method()==='PATCH'){const data=req.postDataJSON();assert.equal(data.version,route.version);assert.equal(data.inspector_id,'inspector-b');patched++;route={...route,...data,version:route.version+1,inspector_name:'Инспектор Б'};body=route;}
+  else if(u==='/api/notifications')body=[{id:'n1',type:'route_assigned',title:'Назначение маршрута',message:'Открыть тестовый маршрут',route_id:route.id,created_at:route.created_at},{id:'n2',type:'repair_submitted',title:'Ремонт ожидает проверки',message:'D-01: Выбоина',defect_id:defect.id,number:defect.number,created_at:defect.received_at}];
+  else if(u==='/api/reports/contractors')body=[{contractor_id:'c1',name:'Тестовый подрядчик',total:4,completed:2,rework:1,overdue:1,average_repair_hours:3.5}];
+  else throw new Error('Unexpected '+req.method()+' '+u);
+  await r.fulfill({json:body});
+ });
+ await page.goto(process.env.APP_URL||'http://127.0.0.1:8000');
+ await page.getByRole('button',{name:/Уведомления/}).click();
+ await page.getByText('Тестовый подрядчик',{exact:true}).waitFor();
+ if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))console.log(await page.evaluate(()=>[...document.querySelectorAll('body *')].filter(e=>e.getBoundingClientRect().right>innerWidth+1).slice(0,16).map(e=>({tag:e.tagName,class:e.className,width:e.getBoundingClientRect().width,right:e.getBoundingClientRect().right}))));
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+ fs.mkdirSync(path.resolve(__dirname,'../../docs/screenshots/improvements'),{recursive:true});
+ await page.screenshot({path:path.resolve(__dirname,`../../docs/screenshots/improvements/overview-${width}.png`),fullPage:true});
+ await page.getByRole('button',{name:/Назначение маршрута/}).click();
+ await page.getByRole('button',{name:'Изменить назначение',exact:true}).click();
+ await page.locator('.route-edit-form select').selectOption('inspector-b');
+ await page.locator('.route-edit-form input').fill('Обновлённый маршрут');
+ await page.getByRole('button',{name:'Сохранить назначение',exact:true}).click();
+ await page.locator('.route-edit-form').waitFor({state:'detached'});assert.equal(patched,1);
+ await page.getByText('Обновлённый маршрут',{exact:true}).first().waitFor();
+ if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))console.log(await page.evaluate(()=>[...document.querySelectorAll('body *')].filter(e=>e.getBoundingClientRect().right>innerWidth+1).slice(0,16).map(e=>({tag:e.tagName,class:e.className,width:e.getBoundingClientRect().width,right:e.getBoundingClientRect().right}))));
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+ await page.getByRole('button',{name:/Уведомления/}).click();
+ await page.getByRole('button',{name:/Ремонт ожидает проверки/}).click();
+ await page.locator('.ops-defect-description').getByText('Проверка срока ремонта',{exact:true}).waitFor();
+ await page.getByText('Изменить срок проверки',{exact:true}).click();
+ await page.locator('.review-deadline input[type="datetime-local"]').fill('2030-01-01T12:30');
+ await page.locator('.review-deadline textarea').fill('Назначена дополнительная проверка');
+ const deadlineResponse=page.waitForResponse(response=>response.url().includes('/api/defects/defect-test/actions'));
+ await page.getByRole('button',{name:'Сохранить срок проверки',exact:true}).click();
+ assert.equal((await deadlineResponse).status(),200);
+ assert.equal(reviewActionBody.action,'change_review_deadline');
+ assert.equal(reviewActionBody.version,7);
+ assert.equal(reviewActionBody.payload.review_due_at,'2030-01-01T12:30:00.000Z');
+ assert.equal(reviewActionBody.payload.reason,'Назначена дополнительная проверка');
+ assert.equal(Object.hasOwn(reviewActionBody.payload,'comment'),false,'review deadline API receives reason, never comment');
+ assert.deepEqual(errors,[]);console.log(JSON.stringify({width,notifications:true,reports:true,reassignment:true,reviewDeadline:true,errors}));await context.close();
+ }
+ const context=await browser.newContext();const page=await context.newPage();await page.route('**/api/health',r=>r.fulfill({json:{ok:true,demo:false}}));await page.route('**/api/me',r=>r.fulfill({status:401,json:{detail:{message:'Login required'}}}));await page.goto(process.env.APP_URL||'http://127.0.0.1:8000');await page.getByRole('button',{name:'Войти в систему'}).waitFor();assert.equal(await page.locator('input[type=email]').inputValue(),'');assert.equal(await page.locator('input[type=password]').inputValue(),'');assert.equal(await page.locator('.role-picks').count(),0);console.log(JSON.stringify({personalLogin:true,demoCredentialsHidden:true}));await context.close();
+ }finally{await browser.close()}})().catch(e=>{console.error(e);process.exitCode=1});

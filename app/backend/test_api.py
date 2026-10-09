@@ -1,6 +1,8 @@
 import os
+import subprocess
 import sys
 import tempfile
+import threading
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -14,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from fastapi.testclient import TestClient
 from PIL import Image
 import app.main as main
+from sqlalchemy import event
 from app.main import DefectRow, PhotoRow, SessionLocal, app
 
 client = TestClient(app)
@@ -558,6 +561,217 @@ def test_seeded_demo_review_has_matching_synthetic_repair_report():
     assert len(repair["photos"]) == 1
     assert repair["photos"][0]["name"].startswith("ДЕМО")
     assert client.get(repair["photos"][0]["url"]).status_code == 200
+
+
+def test_review_deadline_notifications_and_contractor_report():
+    login("inspector@roads.local")
+    source_photo = upload_png()
+    ticket = create_ticket(source_photo, "review-deadline-cycle").json()
+    login("dispatcher@roads.local")
+    assigned = act(ticket, "assign", {"contractor_id": "c-1", "due_at": main.iso(main.utcnow() + timedelta(days=5))}).json()
+    login("contractor@roads.local")
+    accepted = act(assigned, "accept").json()
+    started = act(accepted, "start").json()
+    repair_photo = upload_png()
+    submitted = act(started, "submit", {"photo_ids": [repair_photo["id"]], "comment": "Ремонт завершён"})
+    assert submitted.status_code == 200, submitted.text
+    ticket = submitted.json()
+    deadline = datetime.fromisoformat(ticket["review_due_at"].replace("Z", "+00:00"))
+    assert timedelta(hours=47, minutes=59) < deadline - main.utcnow() < timedelta(hours=48, minutes=1)
+    assert ticket["repairs"][-1]["review_due_at"] == ticket["review_due_at"]
+    login("inspector@roads.local")
+    assert any(item["type"] == "repair_submitted" and item["defect_id"] == ticket["id"] for item in client.get("/api/notifications").json())
+
+    login("dispatcher@roads.local")
+    report = client.get("/api/reports/contractors")
+    assert report.status_code == 200
+    c1 = next(item for item in report.json() if item["contractor_id"] == "c-1")
+    assert c1["total"] >= 1 and c1["average_repair_hours"] >= 0
+    new_deadline = main.iso(main.utcnow() + timedelta(hours=72))
+    changed = act(ticket, "change_review_deadline", {"review_due_at": new_deadline, "reason": "Увеличен срок проверки"})
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["review_due_at"] == new_deadline
+    assert changed.json()["history"][-1]["action"] == "change_review_deadline"
+
+    with SessionLocal() as db:
+        row = db.get(DefectRow, ticket["id"])
+        repairs = [*row.repairs]
+        latest = dict(repairs[-1]); latest["review_due_at"] = main.iso(main.utcnow() - timedelta(minutes=1))
+        repairs[-1] = latest; row.repairs = repairs
+        db.commit()
+    overdue = client.get(f"/api/defects/{ticket['id']}").json()
+    assert overdue["review_overdue"] is True
+    assert any(item["type"] == "review_overdue" and item["defect_id"] == ticket["id"] for item in client.get("/api/notifications").json())
+    login("inspector@roads.local")
+    rejected = act(overdue, "reject", {"comment": "Нужно исправить край покрытия"})
+    assert rejected.status_code == 200
+    login("contractor@roads.local")
+    assert any(item["type"] == "repair_rejected" and item["defect_id"] == ticket["id"] for item in client.get("/api/notifications").json())
+    assert client.get("/api/reports/contractors").status_code == 403
+
+
+def test_route_reassignment_version_role_and_active_inspection_constraints(monkeypatch):
+    with SessionLocal() as db:
+        if not db.get(main.UserRow, "u-route-inspector-2"):
+            db.add(main.UserRow(id="u-route-inspector-2", name="Инспектор маршрутов 2", email="route-inspector2@roads.local", role="inspector", contractor_id=None, password_hash=main.hash_password(PASSWORD)))
+            db.commit()
+    login("dispatcher@roads.local")
+    preview = preview_route(monkeypatch).json()
+    route = publish_route(preview, preview["options"][0]["id"], name="Тест переназначения").json()
+    blank_name = client.patch(f"/api/routes/{route['id']}", json={"version": route["version"], "name": "   "})
+    assert blank_name.status_code == 422 and blank_name.json()["code"] == "INVALID_NAME"
+    changed = client.patch(f"/api/routes/{route['id']}", json={"version": route["version"], "name": "Переименованный маршрут", "inspector_id": "u-route-inspector-2"})
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["inspector_id"] == "u-route-inspector-2"
+    assert changed.json()["version"] > route["version"]
+    login("route-inspector2@roads.local")
+    assert any(item["type"] == "route_assigned" and item["route_id"] == route["id"] for item in client.get("/api/notifications").json())
+    login("dispatcher@roads.local")
+    stale = client.patch(f"/api/routes/{route['id']}", json={"version": route["version"], "notes": "устаревшее изменение"})
+    assert stale.status_code == 409 and stale.json()["code"] == "CONFLICT"
+
+    login("route-inspector2@roads.local")
+    active = client.post("/api/inspections", json={"section_id": route["id"]})
+    assert active.status_code == 200
+    login("dispatcher@roads.local")
+    refused = client.patch(f"/api/routes/{route['id']}", json={"version": changed.json()["version"], "inspector_id": "u-inspector"})
+    assert refused.status_code == 409 and refused.json()["code"] == "ACTIVE_INSPECTION"
+    client.post(f"/api/inspections/{active.json()['id']}/finish", json={"confirmed": True})
+    login("contractor@roads.local")
+    assert client.patch(f"/api/routes/{route['id']}", json={"version": changed.json()["version"], "name": "Нет"}).status_code == 403
+
+
+def test_route_assignment_serializes_with_inspection_start_on_file_sqlite():
+    with tempfile.TemporaryDirectory(prefix="roads-route-serialization-") as folder:
+        script = r'''import os, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from fastapi.testclient import TestClient
+from sqlalchemy import event
+sys.path.insert(0, os.environ["ROADS_TEST_BACKEND"])
+import app.main as main
+with main.SessionLocal() as db:
+    db.add(main.UserRow(id="u-race-inspector", name="Race inspector", email="race-inspector@roads.local", role="inspector", contractor_id=None, password_hash=main.hash_password("RoadsDemo2026!")))
+    db.commit()
+old_lock = main.lock_route_for_update
+inspection_holds_lock = threading.Event()
+release_inspection = threading.Event()
+second_connection_opened = threading.Event()
+event.listen(main.engine, "connect", lambda connection, record: second_connection_opened.set())
+lock_calls = 0
+def pause_first_route_lock(db, route_id):
+    global lock_calls
+    route = old_lock(db, route_id)
+    lock_calls += 1
+    if lock_calls == 1:
+        inspection_holds_lock.set()
+        if not release_inspection.wait(5):
+            raise RuntimeError("test did not release the inspection transaction")
+    return route
+main.lock_route_for_update = pause_first_route_lock
+inspector = TestClient(main.app)
+dispatcher = TestClient(main.app)
+assert inspector.post("/api/login", json={"email":"inspector@roads.local", "password":"RoadsDemo2026!"}).status_code == 200
+assert dispatcher.post("/api/login", json={"email":"dispatcher@roads.local", "password":"RoadsDemo2026!"}).status_code == 200
+with main.SessionLocal() as db:
+    route = db.get(main.RouteRow, "r-01")
+    version = route.version
+main.engine.dispose()
+second_connection_opened.clear()
+pool = ThreadPoolExecutor(max_workers=2)
+start = pool.submit(inspector.post, "/api/inspections", json={"section_id":"r-01"})
+assert inspection_holds_lock.wait(3), "inspection did not acquire the route serialization lock"
+second_connection_opened.clear()
+reassign = pool.submit(dispatcher.patch, "/api/routes/r-01", json={"version":version, "inspector_id":"u-race-inspector"})
+assert second_connection_opened.wait(3), "concurrent request did not open a separate SQLite connection"
+assert not reassign.done(), "reassignment must wait until inspection start commits"
+release_inspection.set()
+started = start.result(timeout=5)
+changed = reassign.result(timeout=5)
+assert started.status_code == 200, started.text
+assert changed.status_code == 409 and changed.json()["code"] == "ACTIVE_INSPECTION", changed.text
+with main.SessionLocal() as db:
+    route = db.get(main.RouteRow, "r-01")
+    active = db.scalar(main.select(main.InspectionRow).where(main.InspectionRow.section_id == "r-01", main.InspectionRow.status == "active"))
+    assert route.inspector_id == "u-inspector"
+    assert active and active.inspector_id == route.inspector_id
+pool.shutdown(wait=True)
+'''
+        env = dict(os.environ)
+        env.update({
+            "DATABASE_URL": f"sqlite:///{Path(folder, 'serialization.db').as_posix()}",
+            "PHOTO_DIR": str(Path(folder, "photos")),
+            "ROADS_DEMO_MODE": "true",
+            "ROADS_TEST_BACKEND": str(Path(__file__).parent),
+        })
+        result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_contractor_average_repair_hours_uses_latest_start_to_submit():
+    with SessionLocal() as db:
+        db.add(main.UserRow(id="u-metric-contractor", name="Metric Contractor", email="metric-contractor@roads.local", role="contractor", contractor_id="c-metric", password_hash=main.hash_password(PASSWORD)))
+        start1 = datetime(2026, 1, 1, 8, tzinfo=timezone.utc)
+        submit1 = start1 + timedelta(hours=2)
+        reject1 = submit1 + timedelta(hours=5)
+        start2 = reject1 + timedelta(hours=1)
+        submit2 = start2 + timedelta(hours=1)
+        approve2 = submit2 + timedelta(hours=6)
+        history = [
+            {"action": "start", "created_at": main.iso(start1)},
+            {"action": "submit", "created_at": main.iso(submit1)},
+            {"action": "reject", "created_at": main.iso(reject1)},
+            {"action": "start", "created_at": main.iso(start2)},
+            {"action": "submit", "created_at": main.iso(submit2)},
+            {"action": "approve", "created_at": main.iso(approve2)},
+        ]
+        db.add(DefectRow(
+            id="test-repair-duration", number="TEST-REPAIR-DURATION", section_id="r-01", inspection_id=None,
+            type="Выбоина", description="Метрика длительности ремонта", status="closed", lat=44.8, lng=65.5,
+            location_source="gps", accuracy_m=5, observed_at=start1, received_at=start1, inspector_id="u-inspector",
+            contractor_id="c-metric", due_at=start1 + timedelta(days=10), version=1, photos=[], previous_defect_id=None,
+            duplicate_of_id=None, history=history, repairs=[],
+        ))
+        db.commit()
+    login("dispatcher@roads.local")
+    report = client.get("/api/reports/contractors")
+    assert report.status_code == 200, report.text
+    metric = next(item for item in report.json() if item["contractor_id"] == "c-metric")
+    assert metric["average_repair_hours"] == 1.0
+
+
+def test_production_mode_skips_demo_seed_uses_real_accounts_and_requires_https():
+    with tempfile.TemporaryDirectory(prefix="roads-production-mode-test-") as folder:
+        script = r'''import os, sys
+sys.path.insert(0, os.environ["ROADS_TEST_BACKEND"])
+from fastapi.testclient import TestClient
+import app.main as main
+with main.SessionLocal() as db:
+    db.add_all([
+        main.UserRow(id="live-dispatcher", name="Dispatcher", email="dispatch@example.test", role="dispatcher", contractor_id=None, password_hash=main.hash_password("Passw0rd!")),
+        main.UserRow(id="live-inspector", name="Inspector", email="inspector@example.test", role="inspector", contractor_id=None, password_hash=main.hash_password("Passw0rd!")),
+        main.UserRow(id="live-contractor", name="Actual Contractor", email="contractor@example.test", role="contractor", contractor_id="real-co", password_hash=main.hash_password("Passw0rd!")),
+    ])
+    db.commit()
+with TestClient(main.app) as http:
+    assert http.get("/api/health").json()["demo"] is False
+    assert http.post("/api/login", json={"email":"dispatch@example.test", "password":"Passw0rd!"}).json()["code"] == "HTTPS_REQUIRED"
+with TestClient(main.app, base_url="https://localhost") as https:
+    assert https.post("/api/login", json={"email":"dispatch@example.test", "password":"Passw0rd!"}).status_code == 200
+    data = https.get("/api/bootstrap").json()
+    assert data["sections"] == []
+    assert data["contractors"] == [{"id":"real-co", "name":"Actual Contractor"}]
+'''
+        env = dict(os.environ)
+        env.update({
+            "DATABASE_URL": f"sqlite:///{Path(folder, 'production.db').as_posix()}",
+            "PHOTO_DIR": str(Path(folder, "photos")),
+            "ROADS_DEMO_MODE": "false",
+            "ROADS_REQUIRE_HTTPS": "true",
+            "ROADS_TEST_BACKEND": str(Path(__file__).parent),
+        })
+        result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_review_without_repair_report_returns_clear_conflict_instead_of_500():

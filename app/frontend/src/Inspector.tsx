@@ -4,6 +4,10 @@ import { api } from './api';
 import { fieldStorage } from './fieldStorage';
 import { enqueueFieldJob, listFieldJobs, flushFieldQueue, subscribeFieldQueue, type FieldJob } from './fieldQueue';
 import { isConnectionFailure, mergeLocalInspection, type FieldDraft, type FieldSnapshot } from './fieldClient';
+import FieldQueuePanel from './FieldQueuePanel';
+import RouteProgress from './RouteProgress';
+import ReviewDeadline from './ReviewDeadline';
+import type {WorkTarget} from './types';
 import RepairReview, { ReviewEvidenceView } from './RepairReview';
 import type { Bootstrap, Defect, DefectDetail, Inspection, Photo, RouteResults, Section, TrackPoint, User } from './types';
 import { DEFECT_TYPES } from './types';
@@ -18,8 +22,10 @@ type LocationFix = { lat: number; lng: number; accuracy_m: number | null; source
 const uuid = () => globalThis.crypto?.randomUUID?.() ?? `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 const fmtCoord = (v: number) => v.toFixed(5);
 
-export default function Inspector({ user, onLogout }: { user: User; onLogout?: () => void }) {
+export default function Inspector({ user, onLogout,target }: { user: User; onLogout?: () => void;target?:WorkTarget }) {
   const [view, setView] = useState<View>('sections');
+  const targetHandled=useRef(0);
+  useEffect(()=>{if(!target?.nonce||targetHandled.current===target.nonce)return;targetHandled.current=target.nonce;if(target.defectId){void api.get<DefectDetail>(`/defects/${target.defectId}`).then(value=>{setDetail(value);setDetailReturnView('list');setTab('review');setView('detail')}).catch(e=>setError(errText(e)))}else if(target.routeId){setView('sections');void loadBase(true);setNotice('Назначение маршрута обновлено. Выберите нужный маршрут в списке.')}},[target?.nonce]);
   const [tab, setTab] = useState<DefectTab>('created');
   const [sections, setSections] = useState<Section[]>([]);
   const [inspections, setInspections] = useState<Inspection[]>([]);
@@ -190,11 +196,11 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
   },[user.id,syncQueue]);
 
   useEffect(()=>{
-    const warn=(event:BeforeUnloadEvent)=>{if(pendingPoints.current.length){event.preventDefault();event.returnValue='';}};
+    const warn=(event:BeforeUnloadEvent)=>{if(pendingPoints.current.length||(view==='create'&&(photoUploading||draftState!=='Сохранено на устройстве'))){event.preventDefault();event.returnValue='';}};
     window.addEventListener('beforeunload',warn);
     const timer=window.setInterval(()=>{if(inspection?.status==='active' && pendingPoints.current.length)void sendPendingPoints(inspection.id);},3000);
     return()=>{window.removeEventListener('beforeunload',warn);window.clearInterval(timer);};
-  },[inspection?.id,inspection?.status,sendPendingPoints]);
+  },[inspection?.id,inspection?.status,sendPendingPoints,view,draftState,photoUploading]);
 
   useEffect(() => {
     const position = location.position;
@@ -378,6 +384,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
       {storageError && <div className="alert error" role="alert">{storageError}<button className="button secondary small" onClick={()=>{setStorageError('');void syncQueue();}}>Повторить</button></div>}
       {jobs.some(j=>j.status==='error') && <div className="alert error" role="alert">Очередь сохранена, но отправка остановлена: {jobs.find(j=>j.status==='error')?.error || 'Проверьте подключение и доступ к серверу.'}</div>}
       {savedDraft && !loading && view !== 'create' && <div className="field-draft"><div><b>Есть сохранённый черновик</b><span>{savedDraft.type} · {savedDraft.photos.length} фото · {formatDate(savedDraft.updatedAt)}</span></div><button className="button primary small" onClick={restoreDraft}>Продолжить черновик</button><button className="button secondary small" onClick={()=>void discardDraft()}>Удалить черновик</button></div>}
+      <FieldQueuePanel ownerId={user.id} onRetry={syncQueue}/>
       {view === 'create' && <p className="field-save-state" role="status">{draftState || 'Готовим автосохранение…'}</p>}
       {location.status === 'reconnecting' && location.showRecoveryNotice && <div className="inspector-gps-recovery"><Icon name="locate" size={19}/><div><b role="status">Восстанавливаем GPS-сигнал</b><p>Можно продолжать заполнять форму и добавлять фото. Отправка дефекта станет доступна после восстановления GPS.</p></div><span>Ещё {location.recoveryRemainingSeconds} с</span></div>}
       {error && <div className="alert error" role="alert">{error}</div>}{notice && <div className="alert success" role="status">{notice}<button className="inspector-alert-close" aria-label="Закрыть" onClick={() => setNotice('')}>×</button></div>}
@@ -415,7 +422,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
           </>}
         </section>}
 
-        {view === 'survey' && section && inspection && <section className="inspector-survey-view">
+        {view === 'survey' && section && inspection && <section className="inspector-survey-view"><RouteProgress section={section} inspection={inspection} defects={sectionDefects}/>
           <div className="inspector-survey-top"><button className="button secondary small" onClick={() => setView('sections')}><Icon name="left" size={16}/> Мои маршруты</button><div className="inspector-live"><i/> ИДЁТ ОСМОТР</div><span className="inspector-survey-start">Начат {formatDate(inspection.started_at)}</span></div>
           <div className="inspector-survey-map card"><MapView section={section} defects={sectionDefects} track={inspection.points} selectedPosition={gps ? {lat:gps.lat,lng:gps.lng} : null} onPosition={(lat,lng) => { if (!location.ready) return; setGps({lat,lng,accuracy_m:null,source:'manual'}); setManualLat(String(lat)); setManualLng(String(lng)); }} height={420} /></div>
           <div className="inspector-metrics"><div className="stat"><span>Время</span><strong>{elapsed(surveySeconds)}</strong><small>на участке</small></div><div className="stat"><span>Маршрут</span><strong>{distanceKm.toFixed(2)} <small>км</small></strong><small>{pointCount} точек GPS</small></div><div className="stat"><span>Пробелы GPS</span><strong>{gapCount}</strong><small>интервалов более 1 мин</small></div><div className="stat"><span>Дефекты</span><strong>{sectionDefects.filter((d) => d.inspection_id === inspection.id).length}</strong><small>отмечено в этом осмотре</small></div><div className="inspector-gps-stat"><div className="inspector-gps-dot"/><div><b>{location.position ? `GPS · ±${Math.round(location.position.accuracy_m)} м` : 'Ожидаем GPS'}</b><small>{location.position ? `${fmtCoord(location.position.lat)}, ${fmtCoord(location.position.lng)}` : location.status === 'reconnecting' ? 'Повторное определение позиции' : location.error || 'Определяем позицию'}</small></div></div></div>
@@ -450,7 +457,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
 
         {view === 'detail' && detail && <section className="inspector-detail-view"><div className="inspector-form-toolbar"><button className="button secondary small" onClick={() => setView(detailReturnView)}><Icon name="left" size={16}/> {detailReturnView === 'history' ? 'К истории маршрута' : 'К списку'}</button><span className="inspector-detail-id">№ {detail.number} · создан {formatDate(detail.received_at)}</span></div>
           <div className="inspector-detail-grid"><div className="inspector-detail-main"><div className="card inspector-detail-card"><div className="inspector-detail-title"><div><div className="eyebrow">{sections.find((s) => s.id === detail.section_id)?.code ?? 'ДЕФЕКТ'}</div><h2>{detail.type}</h2></div><StatusBadge status={detail.status} overdue={detail.overdue}/></div><p className="inspector-detail-description">{detail.description}</p><div className="inspector-detail-meta"><span><Icon name="clock" size={15}/>{formatDate(detail.observed_at)}</span><span><Icon name="pin" size={15}/>{fmtCoord(detail.lat)}, {fmtCoord(detail.lng)} · {detail.location_source === 'gps' ? 'GPS' : 'отмечено вручную'}</span></div><PhotoGallery photos={detail.photos}/>{detail.previous_defect_id && <div className="inspector-recurrence"><Icon name="refresh" size={16}/> Повторное сообщение по ранее закрытому дефекту</div>}</div>
-            {detail.status === 'review' && detail.repairs?.length > 0 && <RepairReview detail={detail} busy={busy} onAction={act}/>}
+            {detail.status === 'review' && detail.repairs?.length > 0 && <><ReviewDeadline defect={detail}/><RepairReview detail={detail} busy={busy} onAction={act}/></>}
             {detail.repairs?.some((r) => detail.status !== 'review' || !!r.decision) && <div className="card inspector-detail-card"><div className="inspector-card-head"><span className="inspector-step inspector-step-repair"><Icon name="activity" size={17}/></span><div><h2>Фото ремонта</h2><p className="muted">Материалы подрядчика и результат проверки</p></div></div>{detail.repairs.filter((r) => detail.status !== 'review' || !!r.decision).map((r) => <div className="inspector-repair" key={r.id}><div className="inspector-repair-head"><b>{formatDate(r.created_at)}</b>{r.decision && <span className={`inspector-repair-decision ${r.decision}`}>{r.decision === 'accepted' ? 'Принято' : 'На доработку'}</span>}</div><p>{r.comment}</p><PhotoGallery photos={r.photos}/><ReviewEvidenceView repair={r}/>{r.decision_comment && <div className="inspector-review-comment">Комментарий проверки: {r.decision_comment}</div>}</div>)}</div>}
             <div className="card inspector-detail-card"><div className="inspector-card-head"><span className="inspector-step inspector-step-history"><Icon name="history" size={17}/></span><div><h2>История</h2><p className="muted">Все изменения и сообщения по дефекту</p></div></div><History events={detail.history}/></div>
           </div><aside className="inspector-detail-aside"><div className="card inspector-detail-card"><h3>Расположение</h3><div className="inspector-detail-map"><MapView section={sections.find((s) => s.id === detail.section_id) ?? undefined} defects={[detail]} selectedId={detail.id} locateOnOpen={false} height={205}/></div><p className="inspector-detail-address"><Icon name="pin" size={15}/>{fmtCoord(detail.lat)}, {fmtCoord(detail.lng)}</p><span className="muted">{sections.find((s) => s.id === detail.section_id)?.name ?? 'Маршрут'}</span></div>

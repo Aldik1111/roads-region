@@ -20,7 +20,9 @@ const BEFORE=fs.readFileSync(path.resolve(__dirname,'../../backend/demo_photos/d
   let published=false;const actions=[];let uploads=0;
   await page.route('**/api/**',async r=>{
    const u=new URL(r.request().url()).pathname;let body;
-   if(u==='/api/me')body=user;
+   if(u==='/api/health')body={ok:true,demo:true};
+   else if(u==='/api/notifications')body=[];
+   else if(u==='/api/me')body=user;
    else if(u==='/api/bootstrap')body={user,sections:[section],contractors:[],inspectors:[user]};
    else if(u==='/api/inspections')body=[];
    else if(u==='/api/files'&&r.request().method()==='POST'){uploads++;body=inspectorPhoto;}
@@ -55,6 +57,11 @@ const BEFORE=fs.readFileSync(path.resolve(__dirname,'../../backend/demo_photos/d
   await page.locator('.inspector-defect-row').waitFor();assert.match(await review.innerText(),/1/);
   await page.locator('.inspector-defect-row').click();
   const approve=page.locator('.rr-actions .button.primary');await approve.waitFor();
+  await page.locator('.photo-zoom-trigger').first().click();
+  const photoDialog=page.getByRole('dialog',{name:'Просмотр фотографии'});await photoDialog.waitFor();
+  await photoDialog.getByRole('slider').fill('3');
+  assert.equal(await photoDialog.locator('.photo-viewer-image img').evaluate(img=>img.style.width),'300%');
+  await page.keyboard.press('Escape');await photoDialog.waitFor({state:'hidden'});
   assert.equal(await approve.isDisabled(),true,'approval starts disabled without inspector control photos and checklist');
   const reject=page.getByRole('button',{name:'Вернуть на доработку',exact:true});assert.equal(await reject.isDisabled(),true);
   await page.locator('.rr-comment-field textarea').fill('Исправить край покрытия');await reject.click();

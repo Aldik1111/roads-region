@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: roads
+      POSTGRES_DB: roads
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a random hex password in .env.production}
+    volumes:
+      - production_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U roads -d roads"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://roads:${POSTGRES_PASSWORD}@postgres:5432/roads
+      PHOTO_DIR: /data/uploads
+      ROADS_DEMO_MODE: "false"
+      ROADS_REQUIRE_HTTPS: "true"
+      ROADS_REVIEW_HOURS: "48"
+    volumes:
+      - production_files:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set your public DNS name in .env.production}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+volumes:
+  production_db:
+  production_files:
+  caddy_data:
+  caddy_config:

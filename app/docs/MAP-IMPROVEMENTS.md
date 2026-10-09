@@ -1,0 +1,13 @@
+# Map and route progress
+
+`MapView` keeps the last center and zoom in `sessionStorage` for the current map purpose. Supply `viewportKey` when a screen has multiple map roles or needs an explicit scope; otherwise the key uses the section ID and whether the map is used for point picking. A restored view is kept when route data refreshes. The locate control remains an explicit action.
+
+Map tiles default to OpenStreetMap. A deployment may set Vite build variables `VITE_MAP_TILE_URL` and `VITE_MAP_TILE_ATTRIBUTION`; the attribution value is inserted as Leaflet attribution HTML and should identify the selected provider. Browser caching remains in effect. The app does not prefetch or bulk cache tiles. Failed tiles show offline, slow, or error feedback; retry redraws the existing layer and retains the map view.
+
+`RouteProgress` takes `{section, inspection, defects}`. It matches GPS points with reported accuracy up to 100 m to the nearest route segment within an accuracy-aware radius (60–180 m). It estimates traveled distance from the union of route intervals observed between nearby fixes in either direction; it does not assume that the route start was covered or add a backtrack twice. It leaves gaps over 60 seconds unconnected and uses 55 m/s (198 km/h), plus reported accuracy, as a generous movement ceiling between fixes. This is a plausibility heuristic, not a vehicle speed estimate. Points without reported accuracy do not establish route coverage. Green map segments require at least two short, contiguous matched edges. The progress percentage is shown only when at least three points and two edges match, 60% of points match, and no gaps are detected. When evidence is sparse or unreliable, the bar stays gray and the component labels the estimate uncertain. GPS drift and sampling can still misstate distance.
+
+## Focused checks
+
+- Run geometry checks with `node --test frontend/tests/route-progress.test.cjs`.
+- Run the mocked browser tile checks from `frontend` with `node tests/map-usability-browser.cjs` and the configured Playwright module path. The test starts temporary Vite on port 4181 and intercepts every public tile URL, returning a local image or a controlled delay/failure. It checks normal load, slow feedback, tile failure and retry, retained viewport on retry, and restored viewport after route geometry changes. It requests only the visible test viewport and does not access public tile servers.
+- Keep intercepted tile requests limited to the visible test viewport. Do not run bulk requests against public tile servers.

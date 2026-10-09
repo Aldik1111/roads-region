@@ -24,7 +24,7 @@ const { spawn } = require('node:child_process');
     await context.setGeolocation({ latitude: 44.8, longitude: 65.5, accuracy: 18 });
     const page = await context.newPage();
     const owner = { id: 'offline-owner-a', role: 'inspector', name: 'Offline A', email: 'a@example.invalid' };
-    let fileUploads = 0, defectAttempts = 0, failFirstDefect = true, apiOwner = owner.id;
+    let fileUploads = 0, defectAttempts = 0, failFirstDefect = true, rejectRepairable = false, apiOwner = owner.id;
     let releaseUpload, markUploadStarted;
     const uploadStarted = new Promise(resolve => { markUploadStarted = resolve; });
     const uploadGate = new Promise(resolve => { releaseUpload = resolve; });
@@ -49,6 +49,7 @@ const { spawn } = require('node:child_process');
         ownerHeaders.push(request.headers()['x-field-owner']);
         idempotencyKeys.push(request.headers()['idempotency-key']);
         sentOrder.push('defect');
+        if (rejectRepairable) return route.fulfill({ status: 422, json: { code: '422', message: 'Описание не прошло проверку.' } });
         if (failFirstDefect) { failFirstDefect = false; return route.abort('failed'); }
         return route.fulfill({ json: { id: 'defect-created', number: 'TEST-1', photos: request.postDataJSON().photo_ids } });
       }
@@ -132,6 +133,13 @@ const { spawn } = require('node:child_process');
     assert.equal(afterLostResponse.jobs[0].status, 'error');
     assert.match(afterLostResponse.jobs[0].error, /связаться/i);
     assert.equal(afterLostResponse.remote.id, 'remote-photo-1', 'confirmed upload mapping is durable before defect POST');
+    const lostResponseEdit = await page.evaluate(async photoId => {
+      const queue = await import('/src/fieldQueue.ts');
+      try { await queue.reviseRejectedFieldJob('offline-owner-a', 'stable-defect-job', { section_id: 'route-a', photo_ids: [photoId], description: 'changed' }); return 'editable'; }
+      catch (error) { return error.message; }
+    }, staged.photo.id);
+    assert.match(lostResponseEdit, /подтвержд|отклон/i, 'a lost response is ambiguous and must remain uneditable');
+
 
     await page.reload({ waitUntil: 'domcontentloaded' });
     const persisted = await page.evaluate(async photoId => {
@@ -184,6 +192,50 @@ const { spawn } = require('node:child_process');
     assert.equal(finalState.staged.name, 'road.png', 'staged original remains available for draft restoration after confirmation');
     assert.match(finalState.mismatch, /другими данными/, 'same job ID cannot be reused with a different payload');
     assert.deepEqual(finalState.ownerBKeys, ['job:wrong-owner-job']);
+    await page.evaluate(async () => {
+      const queue = await import('/src/fieldQueue.ts');
+      await queue.enqueueFieldJob('offline-owner-a', { id: 'repairable-reject', kind: 'defect', body: { section_id: 'route-a', type: 'Pothole', description: 'bad', photo_ids: [] } });
+    });
+    rejectRepairable = true;
+    await page.evaluate(async () => { const queue = await import('/src/fieldQueue.ts'); try { await queue.flushFieldQueue('offline-owner-a'); } catch {} });
+    rejectRepairable = false;
+    const rejectedEdit = await page.evaluate(async () => {
+      const queue = await import('/src/fieldQueue.ts');
+      const before = await queue.listFieldJobs('offline-owner-a');
+      const old = before.find(job => job.id === 'repairable-reject');
+      const replacementId = await queue.reviseRejectedFieldJob('offline-owner-a', old.id, { description: 'corrected' });
+      const otherOwnerEdit = await queue.reviseRejectedFieldJob('offline-owner-a', 'wrong-owner-job', { description: 'wrong owner' }).then(() => 'editable', error => error.message);
+      return { before: before.map(job => ({ id: job.id, order: job.order })), replacementId, otherOwnerEdit, after: (await queue.listFieldJobs('offline-owner-a')).map(job => ({ id: job.id, order: job.order, body: job.body, status: job.status })) };
+    });
+    assert.notEqual(rejectedEdit.replacementId, 'repairable-reject');
+    assert.equal(rejectedEdit.after.find(job => job.id === rejectedEdit.replacementId).order, rejectedEdit.before.find(job => job.id === 'repairable-reject').order, 'revision retains the FIFO slot');
+    assert.equal(rejectedEdit.after.find(job => job.id === rejectedEdit.replacementId).body.description, 'corrected');
+    assert.equal(rejectedEdit.after.find(job => job.id === rejectedEdit.replacementId).body.photo_ids.length, 0, 'revision preserves frozen photo data');
+    assert.equal(rejectedEdit.after.find(job => job.id === rejectedEdit.replacementId).status, 'pending');
+    assert.match(rejectedEdit.otherOwnerEdit, /подтвержд|отклон/i, 'an owner cannot edit a job that exists only in another owner queue');
+    const cleanupState = await page.evaluate(async ({ photoId, encoded }) => {
+      const queue = await import('/src/fieldQueue.ts');
+      const storage = await import('/src/fieldStorage.ts');
+      await storage.fieldStorage.set('offline-owner-a', 'draft', { photos: [{ id: photoId }] });
+      const protectedDraft = await queue.cleanupConfirmedFieldPhotos('offline-owner-a');
+      const draftPhoto = await storage.fieldStorage.get('offline-owner-a', `photo:${photoId}`);
+      await storage.fieldStorage.remove('offline-owner-a', 'draft');
+      const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+      const concurrentStage = queue.stageFieldPhoto('offline-owner-a', new File([bytes], 'during-cleanup.png', { type: 'image/png' }));
+      const concurrentCleanup = queue.cleanupConfirmedFieldPhotos('offline-owner-a');
+      const [newPhoto, reclaimedDuringStage] = await Promise.all([concurrentStage, concurrentCleanup]);
+      const reclaimed = await queue.cleanupConfirmedFieldPhotos('offline-owner-a');
+      const otherOwnerPhoto = await storage.fieldStorage.get('offline-owner-b', `photo:${photoId}`);
+      const stagedDuringCleanup = await storage.fieldStorage.get('offline-owner-a', `photo:${newPhoto.id}`);
+      const usage = await storage.fieldStorage.usage('offline-owner-a');
+      return { protectedDraft, draftPhotoExists: !!draftPhoto, reclaimedDuringStage, reclaimed, otherOwnerPhoto, stagedDuringCleanup: !!stagedDuringCleanup, usage };
+    }, { photoId: staged.photo.id, encoded: png });
+    assert.equal(cleanupState.protectedDraft.deleted, 0, 'cleanup protects a confirmed photo referenced by the current draft');
+    assert.equal(cleanupState.draftPhotoExists, true);
+    assert.equal(cleanupState.reclaimed.deleted + cleanupState.reclaimedDuringStage.deleted, 1, 'unreferenced server-confirmed staged photos can be reclaimed');
+    assert.equal(cleanupState.otherOwnerPhoto, null, 'photo cleanup remains scoped to its owner');
+    assert.equal(cleanupState.stagedDuringCleanup, true, 'concurrent photo staging is protected from cleanup');
+    assert.ok(cleanupState.usage.bytes >= 0);
     await context.close();
     console.log(JSON.stringify({ passed: true, checks: ['unavailable storage rejects explicitly', 'real IndexedDB persistence', 'last-write serialization', 'owner isolation', 'decoded image staging', 'lost response retry keys', 'photo mapping survives retry', 'enqueue while network worker is blocked', 'FIFO finish order', 'owner verification before mutation'] }, null, 2));
   } finally { await browser.close(); viteServer?.kill(); }
