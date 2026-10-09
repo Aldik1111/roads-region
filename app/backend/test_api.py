@@ -354,6 +354,51 @@ def test_upload_rejects_over_10_mib_before_image_decode():
     assert response.json()["code"] == "FILE_TOO_LARGE"
 
 
+def test_seeded_demo_review_has_matching_synthetic_repair_report():
+    login("inspector@roads.local")
+    response = client.get("/api/defects/demo-defect-4")
+    assert response.status_code == 200
+    defect = response.json()
+    assert defect["status"] == "review"
+    assert len(defect["repairs"]) == 1
+    repair = defect["repairs"][0]
+    assert repair["comment"].startswith("Демо:")
+    assert len(repair["photos"]) == 1
+    assert repair["photos"][0]["name"].startswith("ДЕМО")
+    assert client.get(repair["photos"][0]["url"]).status_code == 200
+
+
+def test_review_without_repair_report_returns_clear_conflict_instead_of_500():
+    with SessionLocal() as db:
+        defect = db.get(DefectRow, "demo-defect-4")
+        old_repairs = defect.repairs
+        defect.status = "review"
+        defect.repairs = []
+        db.commit()
+        version = defect.version
+
+    safe_client = TestClient(app, raise_server_exceptions=False)
+    try:
+        safe_client.post("/api/login", json={"email": "inspector@roads.local", "password": PASSWORD})
+        for action, payload in (("approve", {}), ("reject", {"comment": "Демо: нужен отчёт"})):
+            response = safe_client.post(f"/api/defects/demo-defect-4/actions", json={
+                "action": action, "version": version, **payload,
+            })
+            assert response.status_code == 409, response.text
+            assert response.json()["code"] == "MISSING_REPAIR_REPORT"
+            assert "отчёт" in response.json()["message"].lower()
+        with SessionLocal() as db:
+            unchanged = db.get(DefectRow, "demo-defect-4")
+            assert unchanged.status == "review"
+            assert unchanged.version == version
+    finally:
+        with SessionLocal() as db:
+            defect = db.get(DefectRow, "demo-defect-4")
+            defect.repairs = old_repairs
+            defect.status = "review"
+            db.commit()
+
+
 def osrm_response(*, multiple=False):
     routes = [{
         "geometry": {"type": "LineString", "coordinates": [[65.5001, 44.8001], [65.5100, 44.8100], [65.5200, 44.8200], [65.5501, 44.8501]]},

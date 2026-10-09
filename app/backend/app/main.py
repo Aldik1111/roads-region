@@ -517,7 +517,12 @@ def seed():
         ]
         for index, (number, kind, desc, status, lat, lng, contractor_id, due) in enumerate(examples):
             fid = f"demo-defect-{index+1}"
-            row = DefectRow(id=fid, number=number, section_id="r-01", inspection_id=None, type=kind, description=desc, status=status, lat=lat, lng=lng, location_source="gps", accuracy_m=8.5, observed_at=now-timedelta(days=index+1), received_at=now-timedelta(days=index+1), inspector_id="u-inspector", contractor_id=contractor_id, due_at=due, version=1, photos=[], previous_defect_id=None, duplicate_of_id=None, history=[], repairs=[])
+            demo_repair = [{
+                "id": "demo-repair-report-4", "created_at": iso(now - timedelta(hours=2)),
+                "comment": "Демо: подрядчик сообщил о выполнении ремонта, требуется проверка инспектора.",
+                "photos": ["demo-photo-repair"], "decision": None, "decision_comment": None,
+            }] if status == "review" else []
+            row = DefectRow(id=fid, number=number, section_id="r-01", inspection_id=None, type=kind, description=desc, status=status, lat=lat, lng=lng, location_source="gps", accuracy_m=8.5, observed_at=now-timedelta(days=index+1), received_at=now-timedelta(days=index+1), inspector_id="u-inspector", contractor_id=contractor_id, due_at=due, version=1, photos=[], previous_defect_id=None, duplicate_of_id=None, history=[], repairs=demo_repair)
             audit(row, "created", db.get(UserRow, "u-inspector") if index == 0 else users[0], "Демонстрационная запись", None, {"status": "new"})
             db.add(row)
         # Synthetic illustration assets are intentionally marked demo in their names.
@@ -856,7 +861,10 @@ def defect_action(defect_id: str, body: ActionBody, user: UserRow = Depends(curr
     elif action in ("approve", "reject"):
         require_role(user, "inspector")
         if row.status != "review": raise HTTPException(409, detail={"code": "ILLEGAL_TRANSITION", "message": "Рассмотреть можно только отправленный ремонт"})
-        repair = dict((row.repairs or [])[-1])
+        repairs = row.repairs or []
+        if not repairs or not isinstance(repairs[-1], dict):
+            raise HTTPException(409, detail={"code": "MISSING_REPAIR_REPORT", "message": "Нельзя рассмотреть заявку: подрядчик ещё не приложил отчёт о ремонте"})
+        repair = dict(repairs[-1])
         if action == "approve": row.status = "closed"; repair["decision"] = "accepted"; repair["decision_comment"] = p.get("comment")
         else: row.status = "rework"; repair["decision"] = "rejected"; repair["decision_comment"] = require_text("comment")
         row.repairs = [*(row.repairs or [])[:-1], repair]
