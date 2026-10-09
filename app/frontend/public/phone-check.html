@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#142821">
+  <title>Проверка телефона · Дороги области</title>
+  <style>
+    :root{color-scheme:light;--ink:#172a24;--muted:#66776e;--teal:#126e60;--forest:#142821;--line:#dce1d9;--bg:#f4f5ef;--surface:#fff;--good:#176548;--good-bg:#e8f5ee;--warn:#805716;--warn-bg:#fff4da;--bad:#963f2b;--bad-bg:#fff1ec}
+    *{box-sizing:border-box}
+    html{min-height:100%;background:var(--bg)}
+    body{margin:0;font-family:Manrope,Arial,sans-serif;color:var(--ink);background:var(--bg);font-size:16px;line-height:1.55}
+    a,button{-webkit-tap-highlight-color:transparent}
+    button,a{font:inherit}
+    button:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid #dfac32;outline-offset:3px}
+    .top{background:var(--forest);color:#f3f6ef;padding:22px max(20px,calc((100vw - 720px)/2));}
+    .brand{display:flex;align-items:center;gap:11px;color:inherit;text-decoration:none;font-weight:800;letter-spacing:-.3px}
+    .mark{width:42px;height:42px;display:grid;place-items:center;border-radius:12px;background:#256353;border:1px solid #4a7a68;color:#fff;font-size:20px}
+    .brand small{display:block;color:#a5b9aa;font-size:10px;font-weight:600;letter-spacing:1.5px;margin-top:2px}
+    main{width:min(100% - 32px,620px);margin:27px auto 40px}
+    h1{margin:0 0 8px;font-size:clamp(26px,7vw,34px);line-height:1.16;letter-spacing:-1.1px}
+    .intro{margin:0 0 20px;color:var(--muted);font-size:15px}
+    .panel{background:var(--surface);border:1px solid var(--line);border-radius:17px;padding:19px;margin:14px 0;box-shadow:0 2px 8px #14282108}
+    .panel h2{font-size:17px;letter-spacing:-.3px;margin:0 0 5px}
+    .hint{color:var(--muted);font-size:13px;margin:0 0 15px}
+    .checks{display:grid;gap:0}
+    .check{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:12px 0;border-top:1px solid #edf0eb}
+    .check:first-child{border-top:0}
+    .check strong{display:block;font-size:14px;line-height:1.3}
+    .check small{display:block;color:var(--muted);font-size:12px;margin-top:3px;overflow-wrap:anywhere}
+    .value{text-align:right;white-space:nowrap;font-size:12px;font-weight:800;padding:6px 9px;border-radius:20px;background:#edf0eb;color:#53635a}
+    .value.good{background:var(--good-bg);color:var(--good)}
+    .value.warn{background:var(--warn-bg);color:var(--warn)}
+    .value.bad{background:var(--bad-bg);color:var(--bad)}
+    .actions{display:grid;gap:10px;margin-top:16px}
+    .button{width:100%;min-height:52px;padding:12px 16px;border:1px solid var(--teal);border-radius:11px;background:#fff;color:var(--teal);font-weight:800;text-align:center;text-decoration:none;cursor:pointer;display:flex;align-items:center;justify-content:center}
+    .button.primary{background:var(--teal);color:#fff}
+    .button:hover{filter:brightness(.97)}
+    .button:disabled{opacity:.58;cursor:wait}
+    .notice{padding:13px 14px;border-radius:11px;background:#eff4ef;color:#4c6255;font-size:13px;line-height:1.5}
+    .notice strong{color:var(--forest)}
+    .geo-result{margin-top:14px;padding:13px 14px;border-radius:11px;background:#f5f7f3;border:1px solid var(--line);font-size:14px;overflow-wrap:anywhere}
+    .geo-result[hidden]{display:none}
+    .geo-result.good{background:var(--good-bg);border-color:#b7d8c7;color:#175642}
+    .geo-result.bad{background:var(--bad-bg);border-color:#e8bbaa;color:#923c24}
+    .geo-result p{margin:4px 0 0}
+    details{margin-top:8px}
+    summary{cursor:pointer;font-weight:700;font-size:13px}
+    .coordinates{font-variant-numeric:tabular-nums;font-size:13px;margin-top:6px}
+    .foot{font-size:12px;color:var(--muted);text-align:center;padding:7px 8px}
+    @media(min-width:520px){main{margin-top:36px}.panel{padding:22px}.actions{grid-template-columns:1fr 1fr}}
+    @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+  </style>
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="/" aria-label="Дороги области — открыть приложение">
+      <span class="mark" aria-hidden="true">⌁</span>
+      <span>Дороги области<small>ПОЛЕВАЯ РАБОТА</small></span>
+    </a>
+  </header>
+  <main>
+    <h1>Проверка телефона</h1>
+    <p class="intro">Проверьте соединение и доступ к геопозиции перед выездом на объект.</p>
+
+    <section class="panel" aria-labelledby="connection-title">
+      <h2 id="connection-title">Диагностика</h2>
+      <p class="hint">Показатели обновляются при открытии страницы и по кнопке.</p>
+      <div class="checks" aria-live="polite" aria-atomic="false">
+        <div class="check"><div><strong>Защищённое соединение</strong><small>Нужно для доступа браузера к геопозиции</small></div><span class="value" id="secure-value">Проверяем…</span></div>
+        <div class="check"><div><strong>Геолокация в браузере</strong><small>Доступность функции на этом устройстве</small></div><span class="value" id="geo-value">Проверяем…</span></div>
+        <div class="check"><div><strong>Подключение к сети</strong><small>По данным браузера; доступ в интернет не проверяется</small></div><span class="value" id="online-value">Проверяем…</span></div>
+        <div class="check"><div><strong>Связь с приложением</strong><small id="health-detail">Проверяем /api/health на этом сервере</small></div><span class="value" id="health-value">Проверяем…</span></div>
+        <div class="check"><div><strong>Поддержка офлайн-оболочки</strong><small>Не означает фоновую запись GPS</small></div><span class="value" id="sw-value">Проверяем…</span></div>
+      </div>
+      <div class="actions">
+        <button class="button" id="refresh-button" type="button">Обновить диагностику</button>
+        <a class="button primary" href="/">Открыть приложение <span aria-hidden="true"> →</span></a>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="location-title">
+      <h2 id="location-title">Проверка геопозиции</h2>
+      <p class="hint">По нажатию телефон один раз запросит разрешение и определит позицию.</p>
+      <div class="notice"><strong>Для точной проверки:</strong> подключите телефон и компьютер к одной Wi-Fi сети и оставьте экран телефона включённым. Браузер должен доверять HTTPS сертификату сервера. Если появится запрос, разрешите доступ к геопозиции. Координаты останутся на этой странице и не отправляются на сервер.</div>
+      <div class="actions"><button class="button primary" id="locate-button" type="button">Проверить геопозицию</button></div>
+      <div class="geo-result" id="geo-result" role="status" aria-live="polite" hidden></div>
+    </section>
+
+    <p class="foot">Результат показывает данные браузера телефона. Он не подтверждает работу отдельного GPS оборудования.</p>
+  </main>
+  <script>
+    (() => {
+      const setValue = (id, label, state, detailId, detail) => {
+        const node = document.getElementById(id);
+        node.textContent = label;
+        node.className = `value${state ? ` ${state}` : ''}`;
+        if (detailId && detail !== undefined) document.getElementById(detailId).textContent = detail;
+      };
+
+      async function refreshDiagnostics() {
+        setValue('secure-value', window.isSecureContext ? 'Защищено' : 'Нет HTTPS', window.isSecureContext ? 'good' : 'bad');
+        setValue('geo-value', 'geolocation' in navigator ? 'Доступна' : 'Недоступна', 'geolocation' in navigator ? 'good' : 'bad');
+        setValue('online-value', navigator.onLine ? 'В сети' : 'Нет сети', navigator.onLine ? 'good' : 'bad');
+        setValue('sw-value', 'serviceWorker' in navigator ? 'Поддерживается' : 'Не поддерживается', 'serviceWorker' in navigator ? 'good' : 'warn');
+
+        const button = document.getElementById('refresh-button');
+        const health = document.getElementById('health-value');
+        button.disabled = true;
+        button.textContent = 'Проверяем связь…';
+        health.textContent = 'Проверяем…';
+        health.className = 'value';
+        document.getElementById('health-detail').textContent = 'Запрос к /api/health';
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 6000);
+          let response;
+          try {
+            response = await fetch('/api/health', { method: 'GET', cache: 'no-store', signal: controller.signal, headers: { Accept: 'application/json' } });
+          } finally {
+            clearTimeout(timeout);
+          }
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          if (!(await response.json()).ok) throw new Error('Health check failed');
+          setValue('health-value', 'Доступен', 'good', 'health-detail', 'Сервер ответил на /api/health');
+        } catch (error) {
+          const description = error.name === 'AbortError' ? 'Сервер не ответил за 6 секунд' : 'Нет ответа от /api/health';
+          setValue('health-value', 'Нет связи', 'bad', 'health-detail', description);
+        } finally {
+          button.disabled = false;
+          button.textContent = 'Обновить диагностику';
+        }
+      }
+
+      function requestLocation() {
+        const output = document.getElementById('geo-result');
+        const button = document.getElementById('locate-button');
+        output.hidden = false;
+        output.className = 'geo-result';
+        output.textContent = 'Запрашиваем геопозицию… Подтвердите разрешение в окне браузера, если оно появится.';
+        if (!window.isSecureContext) {
+          output.className = 'geo-result bad';
+          output.textContent = 'Откройте HTTPS-адрес приложения после установки локального сертификата. Для геопозиции нужно защищённое соединение.';
+          return;
+        }
+        if (!('geolocation' in navigator)) {
+          output.className = 'geo-result bad';
+          output.textContent = 'Этот браузер не поддерживает геолокацию.';
+          return;
+        }
+
+        button.disabled = true;
+        button.textContent = 'Определяем позицию…';
+        const restoreButton = () => {
+          button.disabled = false;
+          button.textContent = 'Проверить геопозицию';
+        };
+        navigator.geolocation.getCurrentPosition(position => {
+          const { latitude, longitude, accuracy } = position.coords;
+          const measuredAt = new Date(position.timestamp).toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'medium' });
+          output.className = 'geo-result good';
+          output.innerHTML = `<strong>Геопозиция получена</strong><p>Точность: примерно ${Math.round(accuracy)} м<br>Время измерения: ${measuredAt}</p><details><summary>Показать координаты на этом телефоне</summary><div class="coordinates">Широта: ${latitude.toFixed(6)}<br>Долгота: ${longitude.toFixed(6)}</div></details>`;
+          restoreButton();
+        }, error => {
+          output.className = 'geo-result bad';
+          const reasons = {
+            1: 'Доступ запрещён. Разрешите геопозицию для этого сайта в настройках Chrome и попробуйте снова.',
+            2: 'Телефон не смог определить позицию. Проверьте, включена ли геолокация на устройстве, и повторите попытку.',
+            3: 'Телефон не ответил вовремя. Оставьте экран включённым и попробуйте ещё раз.'
+          };
+          output.textContent = reasons[error.code] || 'Не удалось получить геопозицию. Попробуйте ещё раз.';
+          restoreButton();
+        }, { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
+      }
+
+      document.getElementById('refresh-button').addEventListener('click', refreshDiagnostics);
+      document.getElementById('locate-button').addEventListener('click', requestLocation);
+      window.addEventListener('online', refreshDiagnostics);
+      window.addEventListener('offline', refreshDiagnostics);
+      refreshDiagnostics();
+    })();
+  </script>
+</body>
+</html>

@@ -646,14 +646,14 @@ def me(user: UserRow = Depends(current_user)):
 
 
 @app.post("/api/login")
-def login(body: LoginBody, response: Response, db: Session = Depends(db_dep)):
+def login(body: LoginBody, request: Request, response: Response, db: Session = Depends(db_dep)):
     user = db.scalar(select(UserRow).where(UserRow.email == body.email.lower()))
     if not user or not check_password(body.password, user.password_hash):
         raise HTTPException(401, detail={"code": "INVALID_CREDENTIALS", "message": "Неверный email или пароль"})
     token = secrets.token_urlsafe(32)
     db.add(SessionRow(token=token, user_id=user.id, expires_at=utcnow()+timedelta(days=14)))
     db.commit()
-    response.set_cookie("roads_session", token, httponly=True, samesite="lax", secure=False, max_age=14*86400, path="/")
+    response.set_cookie("roads_session", token, httponly=True, samesite="lax", secure=request.url.scheme == "https", max_age=14*86400, path="/")
     return user_data(user)
 
 
@@ -663,7 +663,7 @@ def logout(request: Request, response: Response, db: Session = Depends(db_dep)):
     if token and (row := db.get(SessionRow, token)):
         db.delete(row)
         db.commit()
-    response.delete_cookie("roads_session", path="/")
+    response.delete_cookie("roads_session", path="/", secure=request.url.scheme == "https", httponly=True, samesite="lax")
     return {"ok": True}
 
 

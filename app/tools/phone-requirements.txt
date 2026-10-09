@@ -1,0 +1,3 @@
+# Optional tools for a LAN phone test, separate from server dependencies.
+cryptography>=44
+qrcode>=8

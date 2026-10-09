@@ -20,6 +20,19 @@ client = TestClient(app)
 PASSWORD = "RoadsDemo2026!"
 
 
+def test_https_login_uses_secure_cookie_and_http_localhost_still_works():
+    for base_url, expected_secure in [("https://192.168.1.108:8443", True), ("http://testserver", False)]:
+        with TestClient(app, base_url=base_url) as browser:
+            result = browser.post("/api/login", json={"email": "inspector@roads.local", "password": PASSWORD})
+            assert result.status_code == 200
+            cookie = result.headers["set-cookie"].lower()
+            assert ("; secure" in cookie) == expected_secure
+            assert "httponly" in cookie and "samesite=lax" in cookie
+            assert browser.get("/api/me").status_code == 200
+            assert browser.post("/api/logout").status_code == 200
+            assert browser.get("/api/me").status_code == 401
+
+
 def login(email):
     response = client.post("/api/login", json={"email": email, "password": PASSWORD})
     assert response.status_code == 200, response.text

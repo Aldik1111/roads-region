@@ -12,3 +12,4 @@ backend/uploads/
 work/
 logs/
 *.pid
+.phone-test/

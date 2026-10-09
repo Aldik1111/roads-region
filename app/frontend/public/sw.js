@@ -17,6 +17,8 @@ self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
   if (event.request.method !== 'GET' || url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
   if (event.request.mode === 'navigate') {
+    // Standalone diagnostics must never replace the offline SPA entry point.
+    if (url.pathname !== '/' && url.pathname !== '/index.html') return;
     event.respondWith((async()=>{
       const cache=await caches.open(SHELL);
       try {
