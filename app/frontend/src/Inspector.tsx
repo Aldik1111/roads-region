@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { api } from './api';
+import { fieldStorage } from './fieldStorage';
+import { enqueueFieldJob, listFieldJobs, flushFieldQueue, subscribeFieldQueue, type FieldJob } from './fieldQueue';
+import { isConnectionFailure, mergeLocalInspection, type FieldDraft, type FieldSnapshot } from './fieldClient';
+import RepairReview, { ReviewEvidenceView } from './RepairReview';
 import type { Bootstrap, Defect, DefectDetail, Inspection, Photo, RouteResults, Section, TrackPoint, User } from './types';
 import { DEFECT_TYPES } from './types';
 import { formatDate, History, Icon, MapView, PhotoGallery, StatusBadge, UploadField } from './components';
@@ -47,6 +51,18 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
   const [clockNow, setClockNow] = useState(Date.now());
   const [showFinishConfirm, setShowFinishConfirm] = useState(false);
   const location = useDeviceLocation();
+  const [jobs, setJobs] = useState<FieldJob[]>([]);
+  const [syncing, setSyncing] = useState(false);
+  const [storageError, setStorageError] = useState('');
+  const [offline, setOffline] = useState(!navigator.onLine);
+  const [savedDraft, setSavedDraft] = useState<FieldDraft | null>(null);
+  const [draftLoaded, setDraftLoaded] = useState(false);
+  const [draftState, setDraftState] = useState('');
+  const [shellReady, setShellReady] = useState(!!navigator.serviceWorker?.controller);
+  const syncInFlight = useRef(false);
+  const suppressDraft = useRef(false);
+  const inspectionRef = useRef(inspection);
+  inspectionRef.current = inspection;
   const gpsGateHeading = useRef<HTMLHeadingElement | null>(null);
   const gpsRetryButton = useRef<HTMLButtonElement | null>(null);
   const idempotency = useRef<{ fingerprint: string; key: string; body: Record<string, unknown> } | null>(null);
@@ -59,9 +75,22 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
     if (!quiet) setLoading(true);
     setError('');
     try {
-      const [boot, inProgress, allDefects] = await Promise.all([
-        api.get<Bootstrap>('/bootstrap'), api.get<Inspection[]>('/inspections'), api.get<Defect[]>('/defects'),
-      ]);
+      let snapshot: FieldSnapshot;
+      try {
+        const [boot, inspections, defects] = await Promise.all([
+          api.get<Bootstrap>('/bootstrap'), api.get<Inspection[]>('/inspections'), api.get<Defect[]>('/defects'),
+        ]);
+        snapshot = {boot,inspections,defects};
+        setOffline(false);
+        await fieldStorage.set(user.id,'snapshot',snapshot);
+      } catch (failure) {
+        if (!isConnectionFailure(failure)) throw failure;
+        const cached=await fieldStorage.get<FieldSnapshot>(user.id,'snapshot');
+        if(!cached) throw new Error('Нет сохранённых назначений. Откройте кабинет при подключении к сети перед выездом.');
+        snapshot=cached;setOffline(true);
+      }
+      const merged=await mergeLocalInspection(user.id,snapshot);
+      const {boot,inspections:inProgress,defects:allDefects}=merged;
       setSections(boot.sections ?? []);
       setInspections(inProgress ?? []);
       setDefects(allDefects ?? []);
@@ -82,30 +111,90 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
     else gpsRetryButton.current?.focus();
   }, [location.ready, location.status]);
   useEffect(() => { const timer = window.setInterval(() => setClockNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
-  useEffect(() => {
-    const warnBeforeExit = (event: BeforeUnloadEvent) => {
-      if (!pendingPoints.current.length && !sendingPoints.current) return;
-      event.preventDefault();
-      event.returnValue = '';
-    };
-    window.addEventListener('beforeunload', warnBeforeExit);
-    return () => window.removeEventListener('beforeunload', warnBeforeExit);
-  }, []);
-  const sendPendingPoints = useCallback(async (id: string, throwOnFailure = false) => {
-    while (sendingPoints.current) await new Promise((resolve) => window.setTimeout(resolve, 80));
-    if (!pendingPoints.current.length) return;
-    sendingPoints.current = true;
-    const batch = pendingPoints.current;
-    pendingPoints.current = [];
+  const reloadJobs = useCallback(async () => {
     try {
-      const updated = await api.post<Inspection>(`/inspections/${id}/points`, { points: batch });
-      setInspection(updated);
-    } catch (e) {
-      pendingPoints.current = [...batch, ...pendingPoints.current];
-      setError(`Точки маршрута пока не отправлены: ${errText(e)}. Они останутся в форме до повторной отправки.`);
-      if (throwOnFailure) throw e;
-    } finally { sendingPoints.current = false; }
-  }, []);
+      const pending=await listFieldJobs(user.id);setJobs(pending);
+      const current=inspectionRef.current;
+      if(current?.status==='active'){
+        const finish=pending.find(j=>j.kind==='finish' && j.inspectionId===current.id);
+        const receipt=await fieldStorage.get<{result:Inspection}>(user.id,'receipt:finish-'+current.id);
+        const finishedAt=finish?.body.finished_at as string | undefined || receipt?.result.finished_at;
+        if(finishedAt)setInspection(latest=>latest?.id===current.id?{...latest,status:'finished',finished_at:finishedAt,confirmed:true}:latest);
+      }
+    } catch (e) { setStorageError(errText(e)); }
+  }, [user.id]);
+  const syncQueue = useCallback(async () => {
+    if (syncInFlight.current || !navigator.onLine || !location.ready || document.visibilityState !== 'visible') return;
+    syncInFlight.current=true;setSyncing(true);
+    try { await flushFieldQueue(user.id); await reloadJobs(); await loadBase(true); }
+    catch(e) { if(isConnectionFailure(e)) setOffline(true); else setStorageError(errText(e)); }
+    finally {syncInFlight.current=false;setSyncing(false);}
+  },[user.id,location.ready,reloadJobs,loadBase]);
+  useEffect(()=>{
+    void reloadJobs();
+    const unsubscribe=subscribeFieldQueue(()=>void reloadJobs());
+    const connected=()=>{setOffline(!navigator.onLine);if(navigator.onLine)void syncQueue();};
+    window.addEventListener('online',connected);window.addEventListener('offline',connected);
+    const timer=window.setInterval(()=>{void reloadJobs();void syncQueue();},15000);
+    void syncQueue();
+    return()=>{unsubscribe();window.clearInterval(timer);window.removeEventListener('online',connected);window.removeEventListener('offline',connected);};
+  },[reloadJobs,syncQueue]);
+  useEffect(()=>{
+    let alive=true;
+    void fieldStorage.get<FieldDraft>(user.id,'draft').then(d=>{if(alive){setSavedDraft(d);setDraftLoaded(true);}}).catch(e=>{if(alive){setStorageError(errText(e));setDraftLoaded(true);}});
+    const update=()=>setShellReady(!!navigator.serviceWorker?.controller);
+    navigator.serviceWorker?.addEventListener('controllerchange',update);
+    return()=>{alive=false;navigator.serviceWorker?.removeEventListener('controllerchange',update);};
+  },[user.id]);
+  useEffect(()=>{
+    if(!inspection) return;
+    void fieldStorage.set(user.id,'activeInspection',inspection).catch(e=>setStorageError(errText(e)));
+  },[user.id,inspection]);
+  useEffect(()=>{
+    if(!draftLoaded || view!=='create' || suppressDraft.current) return;
+    const draft:FieldDraft={sectionId:section?.id??null,type,description,photos,gps,manualLat,manualLng,previousDefectId,idempotency:idempotency.current,updatedAt:new Date().toISOString()};
+    setDraftState('Сохраняем на устройстве…');
+    let alive=true;
+    void fieldStorage.set(user.id,'draft',draft).then(()=>{if(alive){setSavedDraft(draft);setDraftState('Сохранено на устройстве');}}).catch(e=>{if(alive){setDraftState('Не сохранено');setStorageError(errText(e));}});
+    return()=>{alive=false;};
+  },[user.id,draftLoaded,view,section?.id,type,description,photos,gps,manualLat,manualLng,previousDefectId]);
+  const restoreDraft = () => {
+    if(!savedDraft)return;
+    const d=savedDraft;setSection(sections.find(s=>s.id===d.sectionId)??null);setCreateNeedsRoute(!sections.some(s=>s.id===d.sectionId));
+    setType(d.type);setDescription(d.description);setPhotos(d.photos);setGps(d.gps);setManualLat(d.manualLat);setManualLng(d.manualLng);setPreviousDefectId(d.previousDefectId);
+    idempotency.current=d.idempotency;setCreateReturnView('sections');suppressDraft.current=false;setView('create');
+  };
+  const discardDraft=async()=>{
+    if(!window.confirm('Удалить сохранённый черновик? Неотправленные данные этого сообщения будут удалены.'))return;
+    try{await fieldStorage.remove(user.id,'draft');setSavedDraft(null);setDraftState('');}catch(e){setStorageError(errText(e));}
+  };
+  const sendPendingPoints = useCallback(async (id: string) => {
+    if(sendingPoints.current || !pendingPoints.current.length)return;
+    sendingPoints.current=true;
+    try {
+      while(pendingPoints.current.length){
+        // Keep each retry payload stable even when another fix arrives after a storage failure.
+        const batch=[pendingPoints.current[0]];
+        await enqueueFieldJob(user.id,{id:'points-'+batch[0].client_id,kind:'points',inspectionId:id,body:{points:batch}});
+        const committed=new Set(batch.map(p=>p.client_id));
+        pendingPoints.current=pendingPoints.current.filter(p=>!committed.has(p.client_id));
+        setInspection(current=>{
+          if(!current || current.id!==id)return current;
+          const points=new Map(current.points.map(p=>[p.client_id,p]));batch.forEach(p=>points.set(p.client_id,p));
+          return {...current,points:[...points.values()]};
+        });
+      }
+      void syncQueue();
+    }catch(e){setStorageError('Точки ещё не сохранены: '+errText(e));}
+    finally{sendingPoints.current=false;}
+  },[user.id,syncQueue]);
+
+  useEffect(()=>{
+    const warn=(event:BeforeUnloadEvent)=>{if(pendingPoints.current.length){event.preventDefault();event.returnValue='';}};
+    window.addEventListener('beforeunload',warn);
+    const timer=window.setInterval(()=>{if(inspection?.status==='active' && pendingPoints.current.length)void sendPendingPoints(inspection.id);},3000);
+    return()=>{window.removeEventListener('beforeunload',warn);window.clearInterval(timer);};
+  },[inspection?.id,inspection?.status,sendPendingPoints]);
 
   useEffect(() => {
     const position = location.position;
@@ -137,6 +226,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
       return;
     }
     if (!location.hasFreshPosition) return;
+    if (offline || jobs.length) {setError('Перед началом нового осмотра подключитесь к сети и отправьте очередь.');return;}
     if (s.state === 'completed' && !repeat) {
       setError('Этот маршрут уже осмотрен. Для нового осмотра выберите «Повторить осмотр».');
       return;
@@ -144,6 +234,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
     setBusy(true);
     try {
       const created = await api.post<Inspection>('/inspections', { section_id: s.id });
+      await fieldStorage.set(user.id,'activeInspection',created);
       setInspection(created); setSections((routes) => routes.map((route) => route.id === s.id ? { ...route, state: 'in_progress' } : route)); setGps(null); pendingPoints.current = []; lastSentPoint.current = ''; setListSectionId(null); setView('survey');
     } catch (e) { setError(errText(e)); }
     finally { setBusy(false); }
@@ -151,50 +242,20 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
 
   const goToSectionSurvey = (s: Section) => { setSection(s); if (inspection?.section_id === s.id && inspection.status === 'active') setView('survey'); };
   const finishInspection = async () => {
-    if (!location.ready || !inspection || finishingInspection.current) return;
-    finishingInspection.current = true;
-    let resumeTrack = false;
-    setBusy(true); setError('');
-    const acceptFinished = async (finished: Inspection) => {
-      const ignored = pendingPoints.current.length;
-      pendingPoints.current = [];
-      setInspection(finished);
-      setShowFinishConfirm(false);
-      setView('sections');
-      setNotice(ignored ? `Осмотр уже завершён. ${ignored} GPS-точек, полученных после завершения, не отправлялись.` : 'Осмотр завершён и сохранён.');
-      await loadBase(true);
-    };
-    try {
-      const latest = await api.get<Inspection>(`/inspections/${inspection.id}`);
-      if (latest.status === 'finished') { await acceptFinished(latest); return; }
-      setInspection(latest);
-      await sendPendingPoints(inspection.id, true);
-      const result = await api.post<Inspection>(`/inspections/${inspection.id}/finish`, { confirmed: true });
-      await acceptFinished(result);
-    } catch (e) {
-      let latest: Inspection | null = null;
-      try { latest = await api.get<Inspection>(`/inspections/${inspection.id}`); } catch { /* Keep queued points until the server status can be confirmed. */ }
-      if (latest?.status === 'finished') await acceptFinished(latest);
-      else {
-        setError(errText(e));
-        if (latest?.status === 'active') {
-          setInspection(latest);
-          resumeTrack = true;
-        }
-      }
-    }
-    finally {
-      finishingInspection.current = false;
-      if (resumeTrack && location.ready) {
-        const position = location.position;
-        if (position && position.recorded_at !== lastSentPoint.current) {
-          lastSentPoint.current = position.recorded_at;
-          pendingPoints.current.push({ client_id: uuid(), lat: position.lat, lng: position.lng, recorded_at: position.recorded_at, accuracy_m: position.accuracy_m });
-        }
-        if (pendingPoints.current.length) void sendPendingPoints(inspection.id);
-      }
-      setBusy(false);
-    }
+    if(!location.ready || !inspection || finishingInspection.current)return;
+    finishingInspection.current=true;setBusy(true);setError('');
+    try{
+      while(sendingPoints.current)await new Promise(resolve=>window.setTimeout(resolve,50));
+      await sendPendingPoints(inspection.id);
+      if(pendingPoints.current.length)throw new Error('Сначала необходимо сохранить оставшиеся GPS-точки.');
+      const finishedAt=new Date().toISOString();
+      await enqueueFieldJob(user.id,{id:'finish-'+inspection.id,kind:'finish',inspectionId:inspection.id,body:{confirmed:true,finished_at:finishedAt}});
+      const finished:Inspection={...inspection,status:'finished',confirmed:true,finished_at:finishedAt};
+      setInspection(finished);setShowFinishConfirm(false);setView('sections');
+      setNotice('Осмотр сохранён на устройстве. Завершение будет подтверждено сервером после отправки очереди.');
+      await reloadJobs();void syncQueue();
+    }catch(e){setError(errText(e));}
+    finally{finishingInspection.current=false;setBusy(false);}
   };
 
   const manualCoordinates = (latRaw: string, lngRaw: string) => {
@@ -209,6 +270,8 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
 
   const beginCreate = (previousId: string | null = null) => {
     if (!location.ready) return;
+    if(savedDraft){restoreDraft();return;}
+    suppressDraft.current=false;idempotency.current=null;
     setType(DEFECT_TYPES[0]); setDescription(''); setPhotos([]); setPhotoUploading(false); setError(''); setNotice('');
     setPreviousDefectId(previousId);
     setCreateReturnView(view === 'survey' ? 'survey' : view === 'list' ? 'list' : view === 'detail' ? 'detail' : 'sections');
@@ -232,10 +295,15 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
     const retryBody = idempotency.current.body;
     setBusy(true); setError('');
     try {
-      const created = await api.post<DefectDetail>('/defects', retryBody, { 'Idempotency-Key': idempotency.current.key });
-      idempotency.current = null; setDetail(created); setNotice('Сообщение о дефекте отправлено.'); setView('detail'); await loadBase(true);
+      const key=idempotency.current.key;
+      suppressDraft.current=true;
+      await fieldStorage.set(user.id,'draft',{sectionId:section.id,type,description,photos,gps,manualLat,manualLng,previousDefectId,idempotency:idempotency.current,updatedAt:new Date().toISOString()});
+      await enqueueFieldJob(user.id,{id:key,kind:'defect',inspectionId:body.inspection_id??undefined,body:retryBody});
+      await fieldStorage.remove(user.id,'draft');
+      idempotency.current=null;setSavedDraft(null);setPhotos([]);setDescription('');setTab('created');setListSectionId(null);setView('list');
+      setNotice('Сообщение сохранено на устройстве и добавлено в очередь отправки.');await reloadJobs();void syncQueue();
     } catch (err) { setError(`${errText(err)} Повторная отправка с теми же данными использует тот же ключ запроса.`); }
-    finally { setBusy(false); }
+    finally { suppressDraft.current=false;setBusy(false); }
   };
 
   const openList = async (which: DefectTab, routeId: string | null = null) => {
@@ -306,6 +374,11 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
         <button className={view === 'list' && tab === 'review' ? 'active' : ''} onClick={() => void openList('review')}><Icon name="check" size={18}/><span>Проверка работ</span><span className="inspector-nav-count">{reviewDefects.length}</span></button>
       </nav>
       <div className="inspector-pagehead"><div><div className="eyebrow">ПОЛЕВОЙ КАБИНЕТ</div><h1>{view === 'list' && tab === 'review' ? 'Проверка работ' : pageTitle(view, section)}</h1><p className="muted">{view === 'sections' ? 'Выберите назначенный маршрут и начните осмотр' : view === 'survey' ? 'Записывайте маршрут и отмечайте найденные дефекты' : view === 'create' ? 'Сохраните исходную фотографию и точку обнаружения' : view === 'list' ? 'Сообщения и дефекты, ожидающие проверки' : view === 'history' ? 'Пройденные маршруты, GPS-треки и замечания' : 'История и фотографии сохраняются в карточке дефекта'}</p></div>{view === 'sections' && <button className="button primary inspector-head-action" onClick={() => void openList('created')}><Icon name="clipboard" size={17} /> Мои дефекты</button>}</div>
+      <div className="field-status" role="status"><div><b>{offline ? 'Нет связи с сервером' : syncing ? 'Отправляем данные…' : jobs.length ? `Ожидают отправки: ${jobs.length}` : 'Нет ожидающих отправок'}</b><span>{offline ? 'Данные сохраняются на этом устройстве. Карта без сети может быть без подложки.' : 'Фото, сообщения и GPS-точки отправляются с подтверждением сервера.'}</span><small>{shellReady ? 'Приложение доступно для повторного открытия без сети' : 'Готовим приложение для открытия без сети…'}</small></div><button className="button secondary small" disabled={syncing || !location.ready || !navigator.onLine} onClick={()=>void syncQueue()}>{syncing ? 'Отправляем…' : 'Отправить очередь'}</button></div>
+      {storageError && <div className="alert error" role="alert">{storageError}<button className="button secondary small" onClick={()=>{setStorageError('');void syncQueue();}}>Повторить</button></div>}
+      {jobs.some(j=>j.status==='error') && <div className="alert error" role="alert">Очередь сохранена, но отправка остановлена: {jobs.find(j=>j.status==='error')?.error || 'Проверьте подключение и доступ к серверу.'}</div>}
+      {savedDraft && !loading && view !== 'create' && <div className="field-draft"><div><b>Есть сохранённый черновик</b><span>{savedDraft.type} · {savedDraft.photos.length} фото · {formatDate(savedDraft.updatedAt)}</span></div><button className="button primary small" onClick={restoreDraft}>Продолжить черновик</button><button className="button secondary small" onClick={()=>void discardDraft()}>Удалить черновик</button></div>}
+      {view === 'create' && <p className="field-save-state" role="status">{draftState || 'Готовим автосохранение…'}</p>}
       {location.status === 'reconnecting' && location.showRecoveryNotice && <div className="inspector-gps-recovery"><Icon name="locate" size={19}/><div><b role="status">Восстанавливаем GPS-сигнал</b><p>Можно продолжать заполнять форму и добавлять фото. Отправка дефекта станет доступна после восстановления GPS.</p></div><span>Ещё {location.recoveryRemainingSeconds} с</span></div>}
       {error && <div className="alert error" role="alert">{error}</div>}{notice && <div className="alert success" role="status">{notice}<button className="inspector-alert-close" aria-label="Закрыть" onClick={() => setNotice('')}>×</button></div>}
       {loading ? <div className="card inspector-loading"><span className="inspector-spinner" /> Загружаем данные…</div> : <>
@@ -357,7 +430,7 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
               <label className="field"><span>Тип дефекта <em>*</em></span><select className="select" value={type} onChange={(e) => setType(e.target.value)}>{DEFECT_TYPES.map((t) => <option key={t}>{t}</option>)}</select></label>
               <label className="field"><span>Описание <em>*</em></span><textarea className="textarea" value={description} onChange={(e) => setDescription(e.target.value)} required minLength={3} maxLength={2000} placeholder="Опишите размер повреждения, состояние покрытия и возможную опасность…" rows={4}/><small className="muted inspector-count">{description.length}/2000</small></label>
             </div>
-            <div className="card inspector-form-card"><div className="inspector-card-head"><span className="inspector-step">02</span><div><h2>Фотография</h2><p className="muted">Оригинал фото сохраняется для проверки и истории ремонта</p></div></div><UploadField photos={photos} onChange={setPhotos} onBusyChange={setPhotoUploading} label="Добавить фото дефекта" />{!photos.length && <p className="inspector-photo-required"><Icon name="alert" size={15}/> Фото обязательно для отправки</p>}</div>
+            <div className="card inspector-form-card"><div className="inspector-card-head"><span className="inspector-step">02</span><div><h2>Фотография</h2><p className="muted">Оригинал фото сохраняется для проверки и истории ремонта</p></div></div><UploadField ownerId={user.id} photos={photos} onChange={setPhotos} onBusyChange={setPhotoUploading} label="Добавить фото дефекта" />{!photos.length && <p className="inspector-photo-required"><Icon name="alert" size={15}/> Фото обязательно для отправки</p>}</div>
           </div><div className="inspector-location-column">
             <div className="card inspector-form-card inspector-location-card"><div className="inspector-card-head"><span className="inspector-step">03</span><div><h2>Место дефекта</h2><p className="muted">Точка сохраняется вместе с типом геолокации</p></div></div>
               <div className="inspector-location-map"><MapView section={section} defects={sectionDefects} selectedId={detail?.id} selectedPosition={gps ? {lat:gps.lat,lng:gps.lng} : null} onPosition={(lat,lng) => { if (!location.ready) return; setGps({lat,lng,accuracy_m:null,source:'manual'}); setManualLat(String(lat)); setManualLng(String(lng)); setGpsError(''); }} height={236}/><div className="inspector-location-label"><Icon name={gps?.source === 'gps' ? 'locate' : 'pin'} size={15}/>{gps ? `${gps.source === 'gps' ? 'GPS' : 'Отметка на карте'} · ${fmtCoord(gps.lat)}, ${fmtCoord(gps.lng)}` : 'Нажмите на карту, чтобы поставить точку'}</div></div>
@@ -370,17 +443,18 @@ export default function Inspector({ user, onLogout }: { user: User; onLogout?: (
         </form>}
 
         {view === 'list' && <section className="inspector-list-view"><div className="inspector-list-head"><div className="tabs"><button className={`tab ${tab === 'created' ? 'active' : ''}`} onClick={() => setTab('created')}>Мои сообщения <span>{scopedCreatedCount}</span></button><button className={`tab ${tab === 'review' ? 'active' : ''}`} onClick={() => setTab('review')}>На проверке <span>{scopedReviewCount}</span></button></div><div className="inspector-list-actions"><button className="button secondary small" disabled={refreshing} onClick={() => void refreshList()}><Icon name="refresh" size={16}/>{refreshing ? 'Обновляем…' : 'Обновить'}</button>{tab === 'created' && <button className="button primary small" onClick={() => beginCreate()}><Icon name="plus" size={16}/> Новый дефект</button>}</div></div>
+          {tab === 'created' && jobs.filter(j=>j.kind==='defect').map(job=><div className="card field-queued-defect" key={job.id}><b>{String(job.body.type)} · сохранено на устройстве</b><p>{String(job.body.description)}</p><span>{job.status === 'error' ? 'Нужен повтор отправки' : job.status === 'sending' ? 'Отправляем на сервер…' : 'Ожидает отправки'}</span></div>)}
           {listSectionId && <div className="inspector-route-filter"><Icon name="route" size={16}/><span>Маршрут: <b>{sections.find((route) => route.id === listSectionId)?.name ?? section?.name}</b></span><button className="button secondary small" onClick={() => void openList(tab)}>Показать все</button></div>}
-          {scopedDefects.length ? <div className="inspector-defect-list">{scopedDefects.map((d) => <button type="button" className="inspector-defect-row card" key={d.id} onClick={() => void openDetail(d)}><span className="inspector-defect-thumb">{d.photos[0]?.url ? <img src={d.photos[0].url} alt="Фото дефекта"/> : <Icon name="camera" size={22}/>}</span><span className="inspector-defect-info"><b>{d.type} <small>№ {d.number}</small></b><span>{sections.find((s) => s.id === d.section_id)?.name ?? d.section_id} · {formatDate(d.observed_at)}</span><small>{d.description || 'Без описания'}</small></span><StatusBadge status={d.status} overdue={d.overdue}/><Icon name="right" size={18}/></button>)}</div> : <div className="empty inspector-empty"><span className="inspector-empty-icon"><Icon name={tab === 'review' ? 'check' : 'clipboard'} size={23}/></span><b>{tab === 'review' ? 'Нет работ на проверке' : listSectionId ? 'На этом маршруте пока нет сообщений' : 'Сообщений пока нет'}</b><span>{tab === 'review' ? 'Когда подрядчик отправит работу, она появится здесь.' : 'Зафиксируйте дефект на одном из назначенных маршрутов.'}</span>{tab === 'created' && <button className="button secondary small" onClick={() => beginCreate()}>Добавить дефект</button>}</div>}
+          {scopedDefects.length ? <div className="inspector-defect-list">{scopedDefects.map((d) => <button type="button" className="inspector-defect-row card" key={d.id} onClick={() => void openDetail(d)}><span className="inspector-defect-thumb">{d.photos[0]?.url ? <img src={d.photos[0].url} alt="Фото дефекта"/> : <Icon name="camera" size={22}/>}</span><span className="inspector-defect-info"><b>{d.type} <small>№ {d.number}</small></b><span>{sections.find((s) => s.id === d.section_id)?.name ?? d.section_id} · {formatDate(d.observed_at)}</span><small>{d.description || 'Без описания'}</small></span><StatusBadge status={d.status} overdue={d.overdue}/><Icon name="right" size={18}/></button>)}</div> : <div className="empty inspector-empty"><span className="inspector-empty-icon"><Icon name={tab === 'review' ? 'check' : 'clipboard'} size={23}/></span><b>{tab === 'review' ? 'Нет работ на проверке' : listSectionId ? 'На этом маршруте пока нет сообщений' : jobs.some(j=>j.kind==='defect') ? 'На сервере пока нет новых сообщений' : 'Сообщений пока нет'}</b><span>{tab === 'review' ? 'Когда подрядчик отправит работу, она появится здесь.' : 'Зафиксируйте дефект на одном из назначенных маршрутов.'}</span>{tab === 'created' && <button className="button secondary small" onClick={() => beginCreate()}>Добавить дефект</button>}</div>}
         </section>}
 
         {view === 'detail' && detail && <section className="inspector-detail-view"><div className="inspector-form-toolbar"><button className="button secondary small" onClick={() => setView(detailReturnView)}><Icon name="left" size={16}/> {detailReturnView === 'history' ? 'К истории маршрута' : 'К списку'}</button><span className="inspector-detail-id">№ {detail.number} · создан {formatDate(detail.received_at)}</span></div>
           <div className="inspector-detail-grid"><div className="inspector-detail-main"><div className="card inspector-detail-card"><div className="inspector-detail-title"><div><div className="eyebrow">{sections.find((s) => s.id === detail.section_id)?.code ?? 'ДЕФЕКТ'}</div><h2>{detail.type}</h2></div><StatusBadge status={detail.status} overdue={detail.overdue}/></div><p className="inspector-detail-description">{detail.description}</p><div className="inspector-detail-meta"><span><Icon name="clock" size={15}/>{formatDate(detail.observed_at)}</span><span><Icon name="pin" size={15}/>{fmtCoord(detail.lat)}, {fmtCoord(detail.lng)} · {detail.location_source === 'gps' ? 'GPS' : 'отмечено вручную'}</span></div><PhotoGallery photos={detail.photos}/>{detail.previous_defect_id && <div className="inspector-recurrence"><Icon name="refresh" size={16}/> Повторное сообщение по ранее закрытому дефекту</div>}</div>
-            {detail.repairs?.length > 0 && <div className="card inspector-detail-card"><div className="inspector-card-head"><span className="inspector-step inspector-step-repair"><Icon name="activity" size={17}/></span><div><h2>Фото ремонта</h2><p className="muted">Материалы подрядчика и результат проверки</p></div></div>{detail.repairs.map((r) => <div className="inspector-repair" key={r.id}><div className="inspector-repair-head"><b>{formatDate(r.created_at)}</b>{r.decision && <span className={`inspector-repair-decision ${r.decision}`}>{r.decision === 'accepted' ? 'Принято' : 'На доработку'}</span>}</div><p>{r.comment}</p><PhotoGallery photos={r.photos}/>{r.decision_comment && <div className="inspector-review-comment">Комментарий проверки: {r.decision_comment}</div>}</div>)}</div>}
+            {detail.status === 'review' && detail.repairs?.length > 0 && <RepairReview detail={detail} busy={busy} onAction={act}/>}
+            {detail.repairs?.some((r) => detail.status !== 'review' || !!r.decision) && <div className="card inspector-detail-card"><div className="inspector-card-head"><span className="inspector-step inspector-step-repair"><Icon name="activity" size={17}/></span><div><h2>Фото ремонта</h2><p className="muted">Материалы подрядчика и результат проверки</p></div></div>{detail.repairs.filter((r) => detail.status !== 'review' || !!r.decision).map((r) => <div className="inspector-repair" key={r.id}><div className="inspector-repair-head"><b>{formatDate(r.created_at)}</b>{r.decision && <span className={`inspector-repair-decision ${r.decision}`}>{r.decision === 'accepted' ? 'Принято' : 'На доработку'}</span>}</div><p>{r.comment}</p><PhotoGallery photos={r.photos}/><ReviewEvidenceView repair={r}/>{r.decision_comment && <div className="inspector-review-comment">Комментарий проверки: {r.decision_comment}</div>}</div>)}</div>}
             <div className="card inspector-detail-card"><div className="inspector-card-head"><span className="inspector-step inspector-step-history"><Icon name="history" size={17}/></span><div><h2>История</h2><p className="muted">Все изменения и сообщения по дефекту</p></div></div><History events={detail.history}/></div>
           </div><aside className="inspector-detail-aside"><div className="card inspector-detail-card"><h3>Расположение</h3><div className="inspector-detail-map"><MapView section={sections.find((s) => s.id === detail.section_id) ?? undefined} defects={[detail]} selectedId={detail.id} locateOnOpen={false} height={205}/></div><p className="inspector-detail-address"><Icon name="pin" size={15}/>{fmtCoord(detail.lat)}, {fmtCoord(detail.lng)}</p><span className="muted">{sections.find((s) => s.id === detail.section_id)?.name ?? 'Маршрут'}</span></div>
               {detail.status === 'review' && !detail.repairs?.length && <div className="card inspector-detail-card"><h3>Отчёт подрядчика отсутствует</h3><p className="muted">В карточке нет сданного отчёта о ремонте. Приёмка станет доступна после добавления отчёта. Если это демонстрационная запись, проверьте процесс на дефекте, который подрядчик передал инспектору через свой кабинет.</p></div>}
-              {detail.status === 'review' && detail.repairs?.length > 0 && <div className="card inspector-review-actions"><span className="inspector-review-mark"><Icon name="check" size={18}/></span><h3>Проверка ремонта</h3><p className="muted">Сравните фотографии ремонта с исходным состоянием.</p><label className="field"><span>Комментарий <em>обязателен при отказе</em></span><textarea className="textarea" rows={3} value={clarification} onChange={(e) => setClarification(e.target.value)} placeholder="Что нужно исправить?"/></label><button className="button primary" disabled={busy} onClick={() => void act('approve')}>Принять ремонт <Icon name="check" size={16}/></button><button className="button danger" disabled={busy || clarification.trim().length < 2} onClick={() => void act('reject', {comment:clarification.trim()})}>Отправить на доработку</button></div>}
               {detail.status === 'needs_info' && detail.inspector_id === user.id && <div className="card inspector-review-actions"><h3>Уточнение диспетчера</h3><p className="muted">Ответьте, чтобы вернуть сообщение в работу.</p><label className="field"><span>Ответ <em>*</em></span><textarea className="textarea" rows={3} value={clarification} onChange={(e) => setClarification(e.target.value)} placeholder="Добавьте уточнение…"/></label><button className="button primary" disabled={busy || clarification.trim().length < 2} onClick={() => void act('clarify',{comment:clarification.trim()})}>Отправить ответ</button></div>}
               {detail.status === 'closed' && <div className="inspector-recurrence-card"><Icon name="refresh" size={19}/><div><b>Повреждение появилось снова?</b><p>Создайте новое сообщение. Закрытый дефект останется в истории.</p><button className="button secondary small" onClick={() => { setSection(sections.find((s) => s.id === detail.section_id) ?? null); setGps({lat:detail.lat,lng:detail.lng,accuracy_m:null,source:'manual'}); beginCreate(detail.id); }}>Сообщить о повторе</button></div></div>}
           </aside></div>

@@ -3,6 +3,7 @@ import sys
 import tempfile
 from io import BytesIO
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 # Keep both test database and uploads away from the app's live local data.
 os.environ["DATABASE_URL"] = "sqlite://"
@@ -38,6 +39,35 @@ def create_ticket(photo, key="test-create-1"):
         "lat": 44.8491, "lng": 65.5022, "location_source": "gps", "accuracy_m": 6.2,
         "observed_at": "2026-10-08T10:00:00Z", "photo_ids": [photo["id"]],
     })
+
+
+def make_review_evidence(photo_ids, *, checklist=None, lat=44.9, lng=65.6, accuracy_m=7.5, recorded_at=None):
+    return {
+        "photo_ids": photo_ids,
+        "checklist": checklist or {"surface_restored": True, "no_visible_damage": True, "area_safe": True},
+        "lat": lat, "lng": lng, "accuracy_m": accuracy_m,
+        "recorded_at": recorded_at or main.iso(main.utcnow()),
+    }
+
+
+def create_review_ticket(key):
+    login("inspector@roads.local")
+    source_photo = upload_png()
+    ticket = create_ticket(source_photo, key).json()
+    login("contractor2@roads.local")
+    report_photo = upload_png()
+    with SessionLocal() as db:
+        row = db.get(DefectRow, ticket["id"])
+        row.status = "review"
+        row.contractor_id = "c-2"
+        row.repairs = [{
+            "id": f"report-{key}", "created_at": main.iso(main.utcnow()),
+            "comment": "Демо: ремонт передан на проверку.", "photos": [report_photo["id"]],
+            "decision": None, "decision_comment": None,
+        }]
+        db.commit()
+    login("inspector@roads.local")
+    return client.get(f"/api/defects/{ticket['id']}").json()
 
 
 def act(defect, action, payload=None, as_user=None):
@@ -88,7 +118,8 @@ def test_login_upload_idempotency_duplicate_and_full_repair_cycle():
     ticket = act(ticket, "start").json()
     ticket = act(ticket, "submit", {"photo_ids": [repair_photo["id"]], "comment": "Демо: повторная отправка"}).json()
     login("inspector@roads.local")
-    closed = act(ticket, "approve", {"comment": "Демо: принято"})
+    evidence_photo = upload_png()
+    closed = act(ticket, "approve", {"comment": "Демо: принято", "review_evidence": make_review_evidence([evidence_photo["id"]])})
     assert closed.status_code == 200, closed.text
     assert closed.json()["status"] == "closed"
     assert closed.json()["repairs"][-1]["decision"] == "accepted"
@@ -352,6 +383,154 @@ def test_upload_rejects_over_10_mib_before_image_decode():
     response = client.post("/api/files", files={"file": ("oversized.png", content, "image/png")})
     assert response.status_code == 413
     assert response.json()["code"] == "FILE_TOO_LARGE"
+
+
+def test_upload_idempotency_reuses_photo_and_conflicts_on_different_bytes_per_user():
+    login("inspector@roads.local")
+    key = "photo-retry-stable-key"
+    original = make_image_bytes("PNG")
+    first = client.post("/api/files", headers={"Idempotency-Key": key}, files={"file": ("original.png", original, "image/png")})
+    retry = client.post("/api/files", headers={"Idempotency-Key": key}, files={"file": ("retry.png", original, "image/png")})
+    assert first.status_code == retry.status_code == 200
+    assert retry.json()["id"] == first.json()["id"]
+    assert client.get(retry.json()["url"]).content == original
+
+    changed = client.post("/api/files", headers={"Idempotency-Key": key}, files={"file": ("different.jpg", make_image_bytes("JPEG"), "image/jpeg")})
+    assert changed.status_code == 409
+    assert changed.json()["code"] == "IDEMPOTENCY_CONFLICT"
+
+    login("contractor@roads.local")
+    another_user = client.post("/api/files", headers={"Idempotency-Key": key}, files={"file": ("original.png", original, "image/png")})
+    assert another_user.status_code == 200
+    assert another_user.json()["id"] != first.json()["id"]
+
+
+def test_field_owner_header_must_match_session_owner_before_upload_or_defect_mutations():
+    login("inspector@roads.local")
+    headers = {"X-Field-Owner": "u-dispatcher"}
+    rejected_upload = client.post("/api/files", headers=headers, files={
+        "file": ("owner-check.png", make_image_bytes("PNG"), "image/png"),
+    })
+    assert rejected_upload.status_code == 403
+    assert rejected_upload.json()["code"] == "FIELD_OWNER_MISMATCH"
+
+    photo = upload_png()
+    response = client.post("/api/defects", headers={**headers, "Idempotency-Key": "field-owner-mismatch"}, json={
+        "section_id": "r-01", "type": "Выбоина", "description": "Демо: owner guard",
+        "lat": 44.85, "lng": 65.51, "location_source": "gps", "observed_at": "2026-10-10T10:00:00Z",
+        "photo_ids": [photo["id"]],
+    })
+    assert response.status_code == 403
+    assert response.json()["code"] == "FIELD_OWNER_MISMATCH"
+
+
+def test_inspection_finish_accepts_original_offline_timestamp_and_rejects_unreasonable_times():
+    login("inspector@roads.local")
+    inspection = client.post("/api/inspections", json={"section_id": "r-01"}).json()
+    started_at = datetime.fromisoformat(inspection["started_at"].replace("Z", "+00:00"))
+    before_start = main.iso(started_at - timedelta(seconds=1))
+    too_early = client.post(f"/api/inspections/{inspection['id']}/finish", json={"confirmed": True, "finished_at": before_start})
+    assert too_early.status_code == 422
+    assert too_early.json()["code"] == "INVALID_FINISH_TIME"
+    too_late = client.post(f"/api/inspections/{inspection['id']}/finish", json={"confirmed": True, "finished_at": main.iso(main.utcnow() + timedelta(seconds=31))})
+    assert too_late.status_code == 422
+    assert too_late.json()["code"] == "INVALID_FINISH_TIME"
+
+    offline_finish_at = main.iso(started_at + timedelta(seconds=2))
+    finished = client.post(f"/api/inspections/{inspection['id']}/finish", json={"confirmed": True, "finished_at": offline_finish_at})
+    assert finished.status_code == 200, finished.text
+    assert finished.json()["finished_at"] == offline_finish_at
+    repeated = client.post(f"/api/inspections/{inspection['id']}/finish", json={"confirmed": True, "finished_at": offline_finish_at})
+    assert repeated.status_code == 200
+    assert repeated.json() == finished.json()
+
+
+def test_defect_retry_replays_after_its_inspection_has_finished():
+    login("inspector@roads.local")
+    inspection = client.post("/api/inspections", json={"section_id": "r-01"}).json()
+    photo = upload_png()
+    payload = {
+        "section_id": "r-01", "inspection_id": inspection["id"], "type": "Выбоина",
+        "description": "Демо: создание перед потерянным ответом", "lat": 44.85, "lng": 65.51,
+        "location_source": "gps", "accuracy_m": 5, "observed_at": "2026-10-10T09:00:00Z", "photo_ids": [photo["id"]],
+    }
+    key = "lost-response-before-offline-finish"
+    first = client.post("/api/defects", headers={"Idempotency-Key": key}, json=payload)
+    assert first.status_code == 200, first.text
+    finished = client.post(f"/api/inspections/{inspection['id']}/finish", json={"confirmed": True})
+    assert finished.status_code == 200
+
+    retry = client.post("/api/defects", headers={"Idempotency-Key": key}, json=payload)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["id"] == first.json()["id"]
+    new_key = client.post("/api/defects", headers={"Idempotency-Key": "new-key-after-finish"}, json=payload)
+    assert new_key.status_code == 422
+    assert new_key.json()["code"] == "INSPECTION_FINISHED"
+
+
+def test_review_approval_requires_fresh_complete_evidence_and_inspector_owned_photo():
+    ticket = create_review_ticket("review-evidence-validation")
+    evidence_photo = upload_png()
+    contractor_photo_id = ticket["repairs"][0]["photos"][0]["id"]
+
+    missing = act(ticket, "approve")
+    assert missing.status_code == 422
+    assert missing.json()["code"] == "REVIEW_EVIDENCE_REQUIRED"
+
+    invalid_cases = [
+        (make_review_evidence([evidence_photo["id"]], checklist={"surface_restored": True, "no_visible_damage": False, "area_safe": True}), "REVIEW_CHECKLIST_INCOMPLETE"),
+        (make_review_evidence([],), "INVALID_REVIEW_EVIDENCE"),
+        (make_review_evidence([evidence_photo["id"]], lat=91), "INVALID_REVIEW_EVIDENCE"),
+        (make_review_evidence([evidence_photo["id"]], accuracy_m=-1), "INVALID_REVIEW_EVIDENCE"),
+        (make_review_evidence([evidence_photo["id"]], recorded_at=main.iso(main.utcnow() - timedelta(minutes=5, seconds=1))), "REVIEW_EVIDENCE_STALE"),
+        (make_review_evidence([evidence_photo["id"]], recorded_at=main.iso(main.utcnow() + timedelta(seconds=31))), "REVIEW_EVIDENCE_STALE"),
+    ]
+    for evidence, expected_code in invalid_cases:
+        response = act(ticket, "approve", {"review_evidence": evidence})
+        assert response.status_code == 422, response.text
+        assert response.json()["code"] == expected_code
+
+    foreign_photo = act(ticket, "approve", {"review_evidence": make_review_evidence([contractor_photo_id])})
+    assert foreign_photo.status_code == 403
+    assert foreign_photo.json()["code"] == "PHOTO_FORBIDDEN"
+
+    with SessionLocal() as db:
+        if not db.get(main.UserRow, "u-inspector-review-other"):
+            db.add(main.UserRow(id="u-inspector-review-other", name="Демо инспектор другой", email="review-other@roads.local", role="inspector", contractor_id=None, password_hash=main.hash_password(PASSWORD)))
+            db.commit()
+    login("review-other@roads.local")
+    other_photo = upload_png()
+    approved_by_other_inspector = act(ticket, "approve", {
+        "comment": "Демо: проверено вторым инспектором",
+        "review_evidence": make_review_evidence([other_photo["id"]]),
+    })
+    assert approved_by_other_inspector.status_code == 200, approved_by_other_inspector.text
+    assert approved_by_other_inspector.json()["status"] == "closed"
+    assert approved_by_other_inspector.json()["repairs"][-1]["review_evidence"]["inspector_id"] == "u-inspector-review-other"
+    assert approved_by_other_inspector.json()["repairs"][-1]["review_evidence"]["photos"][0]["id"] == other_photo["id"]
+
+
+def test_approval_stores_evidence_and_visible_roles_can_download_evidence_photo():
+    ticket = create_review_ticket("review-evidence-success")
+    evidence_photo = upload_png()
+    evidence = make_review_evidence([evidence_photo["id"]], lat=45.0, lng=66.0)
+    approved = act(ticket, "approve", {"comment": "Проверено на месте", "review_evidence": evidence})
+    assert approved.status_code == 200, approved.text
+    detail = approved.json()
+    assert detail["status"] == "closed"
+    stored = detail["repairs"][-1]["review_evidence"]
+    assert stored["inspector_id"] == "u-inspector"
+    assert stored["lat"] == 45.0 and stored["lng"] == 66.0
+    assert stored["distance_m"] > 1000
+    assert stored["checked_at"]
+    assert stored["recorded_at"] == evidence["recorded_at"]
+    assert stored["checklist"] == evidence["checklist"]
+    assert stored["photos"][0]["id"] == evidence_photo["id"]
+
+    login("contractor2@roads.local")
+    download = client.get(stored["photos"][0]["url"])
+    assert download.status_code == 200
+    assert download.content == client.get(evidence_photo["url"]).content
 
 
 def test_seeded_demo_review_has_matching_synthetic_repair_report():

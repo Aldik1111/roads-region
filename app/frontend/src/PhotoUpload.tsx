@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { Camera, CheckCircle2, Loader2, RefreshCw, Upload, X } from 'lucide-react';
 import { ApiError, upload } from './api';
+import { stageFieldPhoto } from './fieldQueue';
 import type { Photo } from './types';
 import { useDeviceLocation } from './geolocation';
 
-export function UploadField({ photos, onChange, label = 'Фотография', onBusyChange }: { photos: Photo[]; onChange: (photos: Photo[]) => void; label?: string; onBusyChange?: (busy: boolean) => void }) {
+export function UploadField({ photos, onChange, label = 'Фотография', onBusyChange, ownerId }: { photos: Photo[]; onChange: (photos: Photo[]) => void; label?: string; onBusyChange?: (busy: boolean) => void; ownerId?: string }) {
   const [busy, setBusy] = useState(false), [error, setError] = useState(''), [errorCode, setErrorCode] = useState('');
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [uploadedName, setUploadedName] = useState('');
+  const [savedLocally, setSavedLocally] = useState(false);
   const [pageVisible, setPageVisible] = useState(document.visibilityState === 'visible');
   const picker = useRef<HTMLInputElement>(null), camera = useRef<HTMLInputElement>(null);
   const sending = useRef(false), alive = useRef(true), photosRef = useRef(photos), changeRef = useRef(onChange), busyRef = useRef(onBusyChange);
@@ -20,13 +22,13 @@ export function UploadField({ photos, onChange, label = 'Фотография', 
     if (sending.current) return;
     sending.current = true; setBusy(true); busyRef.current?.(true); setError(''); setErrorCode('');
     try {
-      const photo = await upload(file);
+      const photo = ownerId ? await stageFieldPhoto(ownerId, file) : await upload(file);
       if (!alive.current) return;
-      changeRef.current([...photosRef.current, photo]); setPendingFile(null); setUploadedName(file.name);
+      changeRef.current([...photosRef.current, photo]); setPendingFile(null); setUploadedName(file.name); setSavedLocally(!!ownerId);
     } catch (failure) {
       if (!alive.current) return;
       setError((failure as Error).message || 'Не удалось загрузить фотографию.');
-      setErrorCode(failure instanceof ApiError ? failure.code : 'NETWORK_ERROR');
+      setErrorCode(failure instanceof ApiError ? failure.code : (failure as Error)?.name === 'FieldPhotoValidationError' ? 'INVALID_PHOTO' : 'NETWORK_ERROR');
     } finally {
       sending.current = false;
       if (alive.current) { setBusy(false); busyRef.current?.(false); }
@@ -34,7 +36,7 @@ export function UploadField({ photos, onChange, label = 'Фотография', 
   }
   function select(file?: File) {
     if (!file || sending.current) return;
-    setUploadedName(''); setError(''); setErrorCode(''); setPendingFile(null);
+    setUploadedName(''); setSavedLocally(false); setError(''); setErrorCode(''); setPendingFile(null);
     if (!file.size) { setError('Файл пустой. Выберите другую фотографию.'); return; }
     if (file.size > 10 * 1024 * 1024) { setError('Фотография больше 10 МБ. Уменьшите её размер или выберите другой файл.'); return; }
     setPendingFile(file); void send(file);
@@ -54,7 +56,7 @@ export function UploadField({ photos, onChange, label = 'Фотография', 
       <input ref={picker} className="photo-file-input" aria-label={label} type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" disabled={busy} onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; select(file); }}/>
       <input ref={camera} className="photo-file-input" aria-label="Сделать фото камерой" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" disabled={busy} onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; select(file); }}/>
     </div>
-    {uploadedName && !error && <div className="upload-success" role="status"><CheckCircle2 size={15}/>Фото «{uploadedName}» загружено</div>}
-    {error && <div className="alert error upload-error" role="alert"><span>{error}{errorCode === 'GPS_REQUIRED' ? ' Файл сохранён в форме и загрузится после восстановления геолокации.' : ''}</span>{retryable && <button type="button" className="button secondary small" disabled={busy || errorCode === 'GPS_REQUIRED' && !location.ready} onClick={() => pendingFile && void send(pendingFile)}><RefreshCw size={15}/>Повторить загрузку</button>}</div>}
+    {uploadedName && !error && <div className="upload-success" role="status"><CheckCircle2 size={15}/>Фото «{uploadedName}» {savedLocally ? 'сохранено на устройстве' : 'загружено'}</div>}
+    {error && <div className="alert error upload-error" role="alert"><span>{error}{errorCode === 'GPS_REQUIRED' ? ' Файл сохранён в форме и загрузится после восстановления геолокации.' : ''}</span>{retryable && <button type="button" className="button secondary small" disabled={busy || errorCode === 'GPS_REQUIRED' && !location.ready} onClick={() => pendingFile && void send(pendingFile)}><RefreshCw size={15}/>{ownerId ? 'Повторить сохранение' : 'Повторить загрузку'}</button>}</div>}
   </div>;
 }

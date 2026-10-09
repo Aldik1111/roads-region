@@ -168,6 +168,12 @@ async function run() {
   await Promise.resolve();
   assert.equal(tree.props.value.ready, true, 'manual retry preserves bounded recovery access');
   assert.equal(tree.props.value.recoveryRemainingSeconds, 60, 'manual retry does not reset the original deadline');
+  permission.state = 'granted';
+  permission.onchange?.(new Event('change'));
+  tree = renderProvider();
+  assert.equal(tree.props.value.hasFreshPosition, false, 'permission becoming granted does not treat a retained stale fix as live');
+  assert.equal(tree.props.value.position, null);
+  assert.equal(mutationGuard(), null, 'permission changes preserve recovery access without exposing stale coordinates');
   watches.at(-1).success({ timestamp: stationaryTimestamp, coords: { latitude: 44.8, longitude: 65.5, accuracy: 45 } });
   tree = renderProvider();
   assert.equal(tree.props.value.hasFreshPosition, false, 'a repeated cached timestamp does not restore live-position status');
@@ -227,6 +233,24 @@ async function run() {
   tree = renderProvider();
   assert.equal(tree.props.value.hasFreshPosition, true, 'a newer real fix after hidden expiry restores access');
 
+  global.document.visibilityState = 'hidden';
+  visibilityHandler();
+  now += 35_000;
+  global.document.visibilityState = 'visible';
+  visibilityHandler();
+  tree = renderProvider();
+  assert.equal(tree.props.value.ready, true, 'visibility resume immediately derives recovery when a fix aged past 30 seconds while hidden');
+  assert.equal(tree.props.value.hasFreshPosition, false);
+  assert.equal(tree.props.value.position, null);
+  assert.equal(tree.props.value.recoveryRemainingSeconds, 55, 'hidden age expiry uses the absolute fix timestamp + 90 seconds deadline');
+  assert.equal(tree.props.value.showRecoveryNotice, false, 'age-based recovery keeps the first 15 seconds quiet even if hidden');
+  assert.equal(mutationGuard(), null, 'visibility resume exposes only bounded recovery access');
+  now += 10_000;
+  tickExpiry();
+  tree = renderProvider();
+  assert.equal(tree.props.value.recoveryRemainingSeconds, 45);
+  assert.equal(tree.props.value.showRecoveryNotice, true, 'recovery notice appears 15 seconds after the absolute age-based grace start');
+
   permission.state = 'denied';
   permission.onchange?.(new Event('change'));
   tree = renderProvider();
@@ -238,7 +262,7 @@ async function run() {
 
   console.log(JSON.stringify({
     passed: true,
-    checks: ['low-accuracy browser watch', 'late permission grant retry', 'granted/provider code-1 diagnostic', 'timeout recovery', 'sequential stationary refresh', 'hidden fresh fix retention', 'no-fix initial failure gate', '15-second notice delay', '60-second age-based grace', 'mutation guard during grace', 'manual retry preserves deadline', 'cached timestamp does not restore live status', 'repeated errors do not extend grace', '60-second error-based grace', 'fresh-fix recovery', 'hidden elapsed time expires grace', 'permission-loss immediate clear'],
+    checks: ['low-accuracy browser watch', 'late permission grant retry', 'granted/provider code-1 diagnostic', 'timeout recovery', 'sequential stationary refresh', 'hidden fresh fix retention', 'no-fix initial failure gate', '15-second notice delay', '60-second age-based grace', 'mutation guard during grace', 'manual retry preserves deadline', 'permission change preserves recovery', 'cached timestamp does not restore live status', 'repeated errors do not extend grace', '60-second error-based grace', 'fresh-fix recovery', 'hidden elapsed time expires grace', 'visible resume derives age-based grace immediately', 'permission-loss immediate clear'],
     activeWatchCount: activeWatches,
     oneShotRefreshCount: oneShots.length,
   }, null, 2));

@@ -1,5 +1,7 @@
 import {useEffect,useState} from 'react';
 import {api} from './api';
+import {fieldStorage} from './fieldStorage';
+import {isConnectionFailure} from './fieldClient';
 import type {Role,User} from './types';
 import {Icon} from './components';
 import Inspector from './Inspector';
@@ -13,10 +15,12 @@ export default function App() {
  const [loading,setLoading]=useState(true);
  const [area,setArea]=useState<'routes'|'defects'>('routes');
  const [sessionError,setSessionError]=useState('');
- useEffect(()=>{api.get<User>('/me').then(setUser).catch(()=>{}).finally(()=>setLoading(false))},[]);
- async function logout(){try{await api.post('/logout');setUser(null);setArea('routes');setSessionError('')}catch(e){setSessionError((e as Error).message)}}
+ useEffect(()=>{let active=true; void (async()=>{try{const current=await api.get<User>('/me');if(active)setUser(current);await fieldStorage.set('device','session',current);}catch(error){if(isConnectionFailure(error)){try{const saved=await fieldStorage.get<User>('device','session');if(active && saved){setUser(saved);setSessionError('Нет связи с сервером. Открыты сохранённые данные этого устройства.');}}catch{if(active)setSessionError('Локальные данные недоступны. Подключитесь к сети для входа.');}}else{await fieldStorage.remove('device','session').catch(()=>{});}}finally{if(active)setLoading(false);}})();return()=>{active=false;};},[]);
+ useEffect(()=>{const reconnect=()=>{if(!user)return;void api.get<User>('/me').then(current=>setSessionError(current.id===user.id?'':'Сеанс изменился. Войдите в свою учётную запись для отправки сохранённых данных.')).catch(()=>{});};window.addEventListener('online',reconnect);return()=>window.removeEventListener('online',reconnect);},[user]);
+ async function rememberLogin(current:User){setUser(current);try{await fieldStorage.set('device','session',current);}catch{setSessionError('Не удалось сохранить сеанс для работы без сети.');}}
+ async function logout(){try{await api.post('/logout');await fieldStorage.remove('device','session');setUser(null);setArea('routes');setSessionError('')}catch(e){setSessionError((e as Error).message)}}
  if(loading)return <div className="app-loading"><div className="brand-mark"><Icon name="route" size={26}/></div><p>Открываем рабочее пространство…</p></div>;
- if(!user)return <Login onLogin={setUser}/>;
+ if(!user)return <Login onLogin={current=>void rememberLogin(current)}/>;
  const dispatcher=user.role==='dispatcher';
  return <LocationProvider key={user.id} requireGps={user.role==='inspector'}><div className="app-shell">
   <aside className="desktop-sidebar">

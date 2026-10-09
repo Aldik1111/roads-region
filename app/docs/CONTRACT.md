@@ -56,3 +56,11 @@ Backend pytest: full cycle, rejection/resubmit, wrong role/org, illegal transiti
 
 ## Ownership
 Backend agent backend/** only. Inspector agent frontend/src/Inspector.tsx + inspector.css only. Operations agent frontend/src/Operations.tsx + operations.css only. Root owns frontend scaffold, shared files, assets, docs, start scripts and integration. Do not change another owner's files without coordination. No cloud deployment or external messages.
+
+## Field-work extensions (2026-10-10)
+
+- `POST /api/files` accepts optional `Idempotency-Key`; replay with identical bytes returns the existing photo, different bytes return 409.
+- Queue requests include `X-Field-Owner`; authenticated owner mismatch returns 403 before mutation.
+- Finish accepts optional `finished_at` with the original device completion time, between inspection start and server time plus 30 seconds.
+- Approve requires `review_evidence: {photo_ids, checklist: {surface_restored:true, no_visible_damage:true, area_safe:true}, lat, lng, accuracy_m, recorded_at}`. Server validates photos belong to the reviewing inspector, finite location values and a position no older than five minutes (future tolerance 30 seconds). Any authorized inspector may review; the original author is not required. Reject requires a comment and no acceptance evidence.
+- `Repair.review_evidence` is optional for legacy reports and includes submitted evidence plus `photos`, `inspector_id`, `checked_at`, `distance_m`. See FIELD-WORK.md for UI and offline behavior.

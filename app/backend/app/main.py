@@ -17,7 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 import httpx
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm.exc import StaleDataError
@@ -187,6 +187,24 @@ class PointsBody(BaseModel):
 
 class FinishBody(BaseModel):
     confirmed: bool
+    finished_at: datetime | None = None
+
+
+class ReviewChecklistBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    surface_restored: StrictBool
+    no_visible_damage: StrictBool
+    area_safe: StrictBool
+
+
+class ReviewEvidenceBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    photo_ids: list[str] = Field(min_length=1)
+    checklist: ReviewChecklistBody
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    accuracy_m: float = Field(ge=0)
+    recorded_at: datetime
 
 
 class RoutePointBody(BaseModel):
@@ -273,7 +291,13 @@ def current_user(request: Request, db: Session = Depends(db_dep)) -> UserRow:
     session = db.get(SessionRow, token) if token else None
     if not session or session.expires_at.replace(tzinfo=timezone.utc) <= utcnow():
         raise HTTPException(401, detail={"code": "UNAUTHENTICATED", "message": "Войдите в систему"})
-    return db.get(UserRow, session.user_id)
+    user = db.get(UserRow, session.user_id)
+    if user is None:
+        raise HTTPException(401, detail={"code": "UNAUTHENTICATED", "message": "Войдите в систему"})
+    field_owner = request.headers.get("X-Field-Owner")
+    if field_owner is not None and field_owner != user.id:
+        raise HTTPException(403, detail={"code": "FIELD_OWNER_MISMATCH", "message": "Сессия принадлежит другому пользователю. Повторно войдите перед синхронизацией"})
+    return user
 
 
 def require_role(user: UserRow, *roles: str) -> None:
@@ -467,6 +491,12 @@ def defect_data(row: DefectRow, db: Session, detail: bool = False) -> dict:
         for repair in row.repairs or []:
             repair = dict(repair)
             repair["photos"] = [photo_data(pid) for pid in repair.get("photos", [])]
+            evidence = repair.get("review_evidence")
+            if isinstance(evidence, dict):
+                evidence = dict(evidence)
+                evidence_photo_ids = evidence.pop("photo_ids", evidence.get("photos", []))
+                evidence["photos"] = [photo_data(pid) for pid in evidence_photo_ids]
+                repair["review_evidence"] = evidence
             repairs.append(repair)
         result["repairs"] = repairs
         linked = list(db.scalars(select(DefectRow).where(DefectRow.previous_defect_id == row.id)))
@@ -484,6 +514,43 @@ def get_defect(db: Session, defect_id: str, user: UserRow) -> DefectRow:
     if not row or not visible(row, user):
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "Запись не найдена"})
     return row
+
+
+def validate_review_evidence(raw: Any, row: DefectRow, user: UserRow, db: Session) -> dict:
+    if not isinstance(raw, dict) or not isinstance(raw.get("recorded_at"), str):
+        raise HTTPException(422, detail={"code": "INVALID_REVIEW_EVIDENCE", "message": "Укажите фото, GPS-координаты, точность, время и все пункты проверки"})
+    try:
+        evidence = ReviewEvidenceBody.model_validate(raw)
+    except ValidationError:
+        raise HTTPException(422, detail={"code": "INVALID_REVIEW_EVIDENCE", "message": "Проверьте формат GPS-координат, времени, фото и контрольного списка"})
+    checklist = evidence.checklist.model_dump()
+    if not all(checklist.values()):
+        raise HTTPException(422, detail={"code": "REVIEW_CHECKLIST_INCOMPLETE", "message": "Для приёмки подтвердите восстановление покрытия, отсутствие повреждений и безопасность участка"})
+    values = (evidence.lat, evidence.lng, evidence.accuracy_m)
+    if not all(math.isfinite(value) for value in values):
+        raise HTTPException(422, detail={"code": "INVALID_REVIEW_EVIDENCE", "message": "GPS-координаты и точность должны быть конечными числами"})
+    recorded_at = evidence.recorded_at
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+    checked_at = utcnow()
+    age_seconds = (checked_at - recorded_at).total_seconds()
+    if age_seconds > 5 * 60 or age_seconds < -30:
+        raise HTTPException(422, detail={"code": "REVIEW_EVIDENCE_STALE", "message": "GPS-проверка устарела или имеет время из будущего. Повторите проверку участка"})
+    photo_ids = list(dict.fromkeys(evidence.photo_ids))
+    photos = [db.get(PhotoRow, photo_id) for photo_id in photo_ids]
+    if any(photo is None or photo.owner_id != user.id for photo in photos):
+        raise HTTPException(403, detail={"code": "PHOTO_FORBIDDEN", "message": "Для приёмки используйте фото, загруженные вами"})
+    return {
+        "photo_ids": photo_ids,
+        "checklist": checklist,
+        "lat": evidence.lat,
+        "lng": evidence.lng,
+        "accuracy_m": evidence.accuracy_m,
+        "recorded_at": iso(recorded_at),
+        "inspector_id": user.id,
+        "checked_at": iso(checked_at),
+        "distance_m": round(haversine_m(row.lat, row.lng, evidence.lat, evidence.lng), 1),
+    }
 
 
 def audit(row: DefectRow, action: str, user: UserRow, comment: str | None, before: dict | None, after: dict | None):
@@ -625,7 +692,10 @@ def defect_detail(defect_id: str, user: UserRow = Depends(current_user), db: Ses
 
 
 @app.post("/api/files")
-async def upload_file(file: UploadFile = File(...), user: UserRow = Depends(current_user), db: Session = Depends(db_dep)):
+async def upload_file(
+    file: UploadFile = File(...), user: UserRow = Depends(current_user), db: Session = Depends(db_dep),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
     data = await file.read(10 * 1024 * 1024 + 1)
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(413, detail={"code": "FILE_TOO_LARGE", "message": "Максимальный размер фото — 10 МБ"})
@@ -651,12 +721,40 @@ async def upload_file(file: UploadFile = File(...), user: UserRow = Depends(curr
     # content sniff after verification, and use that detected type for storage
     # and downloads instead of rejecting an otherwise valid original.
     ctype = actual_type
+    raw_key = (idempotency_key or "").strip()
+    if len(raw_key) > 180:
+        raise HTTPException(422, detail={"code": "INVALID_IDEMPOTENCY_KEY", "message": "Ключ повторной отправки слишком длинный"})
+    upload_key = f"upload:{user.id}:{raw_key}" if raw_key else None
+    content_hash = hashlib.sha256(data).hexdigest()
+    if upload_key:
+        existing = db.get(IdempotencyRow, upload_key)
+        if existing:
+            if existing.actor_id != user.id or existing.request_hash != content_hash:
+                raise HTTPException(409, detail={"code": "IDEMPOTENCY_CONFLICT", "message": "Этот ключ уже использован для другого содержимого фото"})
+            photo = db.get(PhotoRow, existing.defect_id)
+            if not photo or not Path(photo.path).is_file():
+                raise HTTPException(409, detail={"code": "PHOTO_RETRY_UNAVAILABLE", "message": "Фото из первоначальной отправки недоступно. Загрузите его с новым ключом"})
+            return photo_data(photo.id)
     pid = str(uuid.uuid4())
     extension = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[ctype]
     path = PHOTO_DIR / f"{pid}{extension}"
     path.write_bytes(data)
-    db.add(PhotoRow(id=pid, owner_id=user.id, name=Path(file.filename or "Фото").name[:255], content_type=ctype, path=str(path), sha256=hashlib.sha256(data).hexdigest()))
-    db.commit()
+    db.add(PhotoRow(id=pid, owner_id=user.id, name=Path(file.filename or "Фото").name[:255], content_type=ctype, path=str(path), sha256=content_hash))
+    if upload_key:
+        db.add(IdempotencyRow(key=upload_key, actor_id=user.id, request_hash=content_hash, defect_id=pid))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if upload_key:
+            winner = db.get(IdempotencyRow, upload_key)
+            if winner and winner.actor_id == user.id and winner.request_hash == content_hash:
+                photo = db.get(PhotoRow, winner.defect_id)
+                if photo and Path(photo.path).is_file():
+                    return photo_data(photo.id)
+            if winner:
+                raise HTTPException(409, detail={"code": "IDEMPOTENCY_CONFLICT", "message": "Этот ключ уже использован для другого содержимого фото"})
+        raise HTTPException(409, detail={"code": "CONFLICT", "message": "Фото уже отправляется. Повторите запрос"})
     return photo_data(pid)
 
 
@@ -667,7 +765,13 @@ def get_photo(photo_id: str, user: UserRow = Depends(current_user), db: Session 
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "Фото не найдено"})
     if photo.owner_id != user.id:
         rows = db.scalars(select(DefectRow)).all()
-        attached = any(photo_id in (r.photos or []) or any(photo_id in a.get("photos", []) for a in (r.repairs or [])) for r in rows if visible(r, user))
+        attached = any(
+            photo_id in (r.photos or []) or any(
+                photo_id in repair.get("photos", []) or photo_id in (repair.get("review_evidence") or {}).get("photo_ids", [])
+                for repair in (r.repairs or [])
+            )
+            for r in rows if visible(r, user)
+        )
         if not attached:
             raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "Фото не найдено"})
     if not Path(photo.path).is_file():
@@ -758,7 +862,16 @@ def finish_inspection(inspection_id: str, body: FinishBody, user: UserRow = Depe
     if row.status == "finished":
         return inspection_data(row)
     if row.status != "active": raise HTTPException(409, detail={"code": "CONFLICT", "message": "Осмотр уже завершён"})
-    row.status = "finished"; row.confirmed = True; row.finished_at = utcnow()
+    now = utcnow()
+    finished_at = body.finished_at or now
+    if finished_at.tzinfo is None:
+        finished_at = finished_at.replace(tzinfo=timezone.utc)
+    started_at = row.started_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    if finished_at < started_at or finished_at > now + timedelta(seconds=30):
+        raise HTTPException(422, detail={"code": "INVALID_FINISH_TIME", "message": "Время завершения должно быть не раньше начала осмотра и не более чем на 30 секунд в будущем"})
+    row.status = "finished"; row.confirmed = True; row.finished_at = finished_at
     db.commit(); db.refresh(row)
     return inspection_data(row)
 
@@ -766,6 +879,12 @@ def finish_inspection(inspection_id: str, body: FinishBody, user: UserRow = Depe
 @app.post("/api/defects")
 def create_defect(body: DefectBody, request: Request, user: UserRow = Depends(current_user), db: Session = Depends(db_dep), idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     require_role(user, "inspector")
+    request_hash = hashlib.sha256(body.model_dump_json().encode()).hexdigest()
+    if idempotency_key:
+        old = db.get(IdempotencyRow, idempotency_key)
+        if old:
+            if old.actor_id != user.id or old.request_hash != request_hash: raise HTTPException(409, detail={"code": "IDEMPOTENCY_CONFLICT", "message": "Ключ уже использован для другого запроса"})
+            return defect_data(get_defect(db, old.defect_id, user), db, True)
     route = db.get(RouteRow, body.section_id)
     if not route or route.inspector_id != user.id: raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "Маршрут не назначен этому инспектору"})
     if body.type not in ("Выбоина", "Трещина", "Просадка", "Люк"): raise HTTPException(422, detail={"code": "INVALID_TYPE", "message": "Неизвестный тип дефекта"})
@@ -780,12 +899,6 @@ def create_defect(body: DefectBody, request: Request, user: UserRow = Depends(cu
     if body.previous_defect_id:
         previous = db.get(DefectRow, body.previous_defect_id)
         if not previous or previous.section_id != body.section_id or previous.status != "closed": raise HTTPException(422, detail={"code": "INVALID_RECURRENCE", "message": "Повторная фиксация должна ссылаться на закрытый дефект этого участка"})
-    request_hash = hashlib.sha256(body.model_dump_json().encode()).hexdigest()
-    if idempotency_key:
-        old = db.get(IdempotencyRow, idempotency_key)
-        if old:
-            if old.actor_id != user.id or old.request_hash != request_hash: raise HTTPException(409, detail={"code": "IDEMPOTENCY_CONFLICT", "message": "Ключ уже использован для другого запроса"})
-            return defect_data(get_defect(db, old.defect_id, user), db, True)
     row = DefectRow(id=str(uuid.uuid4()), number=f"KZO-{utcnow():%y%m%d}-{secrets.randbelow(9000)+1000}", section_id=body.section_id, inspection_id=body.inspection_id, type=body.type, description=body.description, status="new", lat=body.lat, lng=body.lng, location_source=body.location_source, accuracy_m=body.accuracy_m, observed_at=body.observed_at, received_at=utcnow(), inspector_id=user.id, contractor_id=None, due_at=None, version=1, photos=list(dict.fromkeys(body.photo_ids)), previous_defect_id=body.previous_defect_id, duplicate_of_id=None, history=[], repairs=[])
     audit(row, "created", user, None, None, {"status": "new"})
     db.add(row)
@@ -865,8 +978,18 @@ def defect_action(defect_id: str, body: ActionBody, user: UserRow = Depends(curr
         if not repairs or not isinstance(repairs[-1], dict):
             raise HTTPException(409, detail={"code": "MISSING_REPAIR_REPORT", "message": "Нельзя рассмотреть заявку: подрядчик ещё не приложил отчёт о ремонте"})
         repair = dict(repairs[-1])
-        if action == "approve": row.status = "closed"; repair["decision"] = "accepted"; repair["decision_comment"] = p.get("comment")
-        else: row.status = "rework"; repair["decision"] = "rejected"; repair["decision_comment"] = require_text("comment")
+        if action == "approve":
+            raw_evidence = p.get("review_evidence")
+            if raw_evidence is None:
+                raise HTTPException(422, detail={"code": "REVIEW_EVIDENCE_REQUIRED", "message": "Для приёмки приложите GPS-проверку, фото и заполненный контрольный список"})
+            repair["review_evidence"] = validate_review_evidence(raw_evidence, row, user, db)
+            row.status = "closed"; repair["decision"] = "accepted"; repair["decision_comment"] = p.get("comment")
+        else:
+            decision_comment = require_text("comment")
+            raw_evidence = p.get("review_evidence")
+            if raw_evidence is not None:
+                repair["review_evidence"] = validate_review_evidence(raw_evidence, row, user, db)
+            row.status = "rework"; repair["decision"] = "rejected"; repair["decision_comment"] = decision_comment
         row.repairs = [*(row.repairs or [])[:-1], repair]
     elif action in ("reassign", "change_deadline"):
         require_role(user, "dispatcher")
