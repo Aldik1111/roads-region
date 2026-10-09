@@ -1,0 +1,37 @@
+.location-accuracy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #d8e1e8;
+  border-radius: 10px;
+  background: #fff;
+  color: #243746;
+  font-size: 13px;
+}
+
+.location-accuracy--approximate {
+  border-color: #e8cb82;
+  background: #fff9e9;
+}
+
+.location-accuracy--unknown {
+  border-color: #e6c5c2;
+  background: #fff5f3;
+}
+
+.location-accuracy__copy { display: grid; gap: 3px; min-width: 0; }
+.location-accuracy__copy strong { font-size: 13px; }
+.location-accuracy__copy span { color: #5b6b78; overflow-wrap: anywhere; }
+.location-accuracy__refresh {
+  flex: 0 0 auto;
+  border: 1px solid #b9c8d2;
+  border-radius: 7px;
+  background: #fff;
+  color: #263f50;
+  padding: 7px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+.location-accuracy__refresh:focus-visible { outline: 3px solid #78aee0; outline-offset: 2px; }

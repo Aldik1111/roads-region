@@ -102,6 +102,7 @@ class RoutePreviewRow(Base):
     owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     start: Mapped[dict] = mapped_column(JSON)
+    via: Mapped[list | None] = mapped_column(JSON, nullable=True)
     end: Mapped[dict] = mapped_column(JSON)
     options: Mapped[list] = mapped_column(JSON)
     decision_points: Mapped[list] = mapped_column(JSON)
@@ -120,6 +121,7 @@ class RouteRow(Base):
     source: Mapped[str] = mapped_column(String)
     is_demo: Mapped[bool] = mapped_column(Boolean, default=False)
     start: Mapped[dict] = mapped_column(JSON)
+    via: Mapped[list | None] = mapped_column(JSON, nullable=True)
     end: Mapped[dict] = mapped_column(JSON)
     geometry: Mapped[dict] = mapped_column(JSON)
     length_km: Mapped[float] = mapped_column(Float)
@@ -252,6 +254,7 @@ class RoutePointBody(BaseModel):
 
 class RoutePreviewBody(BaseModel):
     start: RoutePointBody
+    via: list[RoutePointBody] = Field(default_factory=list, max_length=8)
     end: RoutePointBody
 
 
@@ -305,6 +308,12 @@ if "routes" in inspect(engine).get_table_names():
     if "version" not in existing_route_columns:
         with engine.begin() as connection:
             connection.exec_driver_sql("ALTER TABLE routes ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+for route_table in ("routes", "route_previews"):
+    if route_table in inspect(engine).get_table_names():
+        route_columns = {column["name"] for column in inspect(engine).get_columns(route_table)}
+        if "via" not in route_columns:
+            with engine.begin() as connection:
+                connection.exec_driver_sql(f"ALTER TABLE {route_table} ADD COLUMN via JSON")
 Index("uq_inspections_one_active_per_inspector", InspectionRow.inspector_id, unique=True,
       sqlite_where=text("status = 'active'"), postgresql_where=text("status = 'active'")).create(engine, checkfirst=True)
 
@@ -405,7 +414,7 @@ def route_data(row: RouteRow, db: Session) -> dict:
         "geometry": row.geometry, "responsible": "Демо: Кызылординский областной филиал" if row.is_demo else (inspector.name if inspector else ""),
         "is_demo": row.is_demo, "inspector_id": row.inspector_id, "inspector_name": inspector.name if inspector else "",
         "notes": row.notes or "", "created_at": iso(row.created_at), "state": state, "duration_min": duration_min, "duration_s": float(row.duration_s or 0),
-        "source": row.source, "start": row.start, "end": row.end, "version": row.version,
+        "source": row.source, "start": row.start, "via": row.via or [], "end": row.end, "version": row.version,
     }
 
 
@@ -435,11 +444,14 @@ def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 6_371_000 * 2 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1 - a)))
 
 
-def fetch_osrm_routes(start: dict, end: dict) -> dict:
+def fetch_osrm_routes(start: dict, end: dict, via: list[dict] | None = None) -> dict:
     base = os.getenv("ROUTING_BASE_URL", "https://router.project-osrm.org").rstrip("/")
-    url = f"{base}/route/v1/driving/{start['lng']},{start['lat']};{end['lng']},{end['lat']}"
+    points = [start, *(via or []), end]
+    coordinates = ";".join(f"{point['lng']},{point['lat']}" for point in points)
+    url = f"{base}/route/v1/driving/{coordinates}"
+    radiuses = ";".join(["500", *("50" for _ in (via or [])), "500"])
     response = httpx.get(url, params={
-        "alternatives": "true", "geometries": "geojson", "overview": "full", "steps": "true", "radiuses": "500;500",
+        "alternatives": "3" if not via else "false", "geometries": "geojson", "overview": "full", "steps": "true", "radiuses": radiuses,
     }, timeout=20.0)
     if response.is_error:
         try:
@@ -454,7 +466,84 @@ def fetch_osrm_routes(start: dict, end: dict) -> dict:
     return response.json()
 
 
-def parse_osrm_preview(payload: Any, start: dict, end: dict) -> tuple[dict, dict, list[dict], list[dict]]:
+def _sample_route_for_fork_search(
+    coords: list[list[float]], reference_lat: float, max_samples: int = 20_000,
+) -> tuple[list[tuple[float, float, float, float]], float]:
+    """Return bounded (x, y, lat, lng) samples and their spacing in meters."""
+    if len(coords) < 2:
+        return [], 10.0
+    reference_lat_rad = math.radians(reference_lat)
+    scale_x = 111_320.0 * math.cos(reference_lat_rad)
+    scale_y = 111_320.0
+    projected = [(lng * scale_x, lat * scale_y, lat, lng) for lng, lat in coords]
+    lengths = [0.0]
+    for previous, current in zip(projected, projected[1:]):
+        lengths.append(lengths[-1] + math.hypot(current[0] - previous[0], current[1] - previous[1]))
+    total = lengths[-1]
+    if total <= 0:
+        return [projected[0]], 10.0
+    count = min(max_samples, max(2, int(math.ceil(total / 10.0)) + 1))
+    spacing = total / (count - 1)
+    result: list[tuple[float, float, float, float]] = []
+    segment = 0
+    for sample_index in range(count):
+        distance = total if sample_index == count - 1 else sample_index * spacing
+        while segment + 1 < len(lengths) - 1 and lengths[segment + 1] < distance:
+            segment += 1
+        span = lengths[segment + 1] - lengths[segment]
+        fraction = 0.0 if span <= 0 else (distance - lengths[segment]) / span
+        a, b = projected[segment], projected[segment + 1]
+        result.append((a[0] + (b[0] - a[0]) * fraction, a[1] + (b[1] - a[1]) * fraction, a[2] + (b[2] - a[2]) * fraction, a[3] + (b[3] - a[3]) * fraction))
+    return result, spacing
+
+
+def _route_divergence_starts(left: list[list[float]], right: list[list[float]], tolerance_m: float = 15.0) -> list[tuple[float, float]]:
+    """Find departures from a shared path with bounded, adaptive spatial sampling.
+
+    The 20,000-sample cap bounds work. On exceptionally long routes, the adaptive
+    tolerance grows with sample spacing; this avoids false forks from sample phase
+    while potentially hiding short detours on those routes.
+    """
+    reference_lat = (left[0][1] + right[0][1]) / 2 if left and right else 0.0
+    left_samples, left_spacing = _sample_route_for_fork_search(left, reference_lat)
+    right_samples, right_spacing = _sample_route_for_fork_search(right, reference_lat)
+    if not left_samples or not right_samples:
+        return []
+    sample_spacing = max(left_spacing, right_spacing)
+    effective_tolerance = math.hypot(tolerance_m, sample_spacing / 2)
+    cell_size = max(20.0, effective_tolerance * 2)
+    grid: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    max_samples_per_cell = 16
+    for x, y, _, _ in right_samples:
+        bucket = grid.setdefault((math.floor(x / cell_size), math.floor(y / cell_size)), [])
+        if len(bucket) < max_samples_per_cell:
+            bucket.append((x, y))
+
+    tolerance_sq = effective_tolerance * effective_tolerance
+    starts: list[tuple[float, float]] = []
+    divergent_run = 0
+    run_start: tuple[float, float] | None = None
+    for x, y, lat, lng in left_samples:
+        gx, gy = math.floor(x / cell_size), math.floor(y / cell_size)
+        nearest_sq = float("inf")
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for other_x, other_y in grid.get((gx + dx, gy + dy), ()):
+                    nearest_sq = min(nearest_sq, (x - other_x) ** 2 + (y - other_y) ** 2)
+        divergent = nearest_sq > tolerance_sq
+        if divergent:
+            if divergent_run == 0:
+                run_start = (lat, lng)
+            divergent_run += 1
+            if divergent_run == 2 and run_start is not None:
+                starts.append(run_start)
+        else:
+            divergent_run = 0
+            run_start = None
+    return starts
+
+
+def parse_osrm_preview(payload: Any, start: dict, end: dict, via: list[dict] | None = None) -> tuple[dict, list[dict], dict, list[dict], list[dict]]:
     if not isinstance(payload, dict):
         raise ValueError("OSRM response must be an object")
     if payload.get("code") in ("NoRoute", "NoSegment") or payload.get("routes") == []:
@@ -462,19 +551,23 @@ def parse_osrm_preview(payload: Any, start: dict, end: dict) -> tuple[dict, dict
     if payload.get("code") != "Ok" or not isinstance(payload.get("routes"), list) or not payload["routes"]:
         raise ValueError("OSRM returned no usable routes")
     waypoints = payload.get("waypoints")
-    if not isinstance(waypoints, list) or len(waypoints) != 2:
-        raise ValueError("OSRM returned invalid snapped endpoints")
+    requested_points = [start, *(via or []), end]
+    if not isinstance(waypoints, list) or len(waypoints) != len(requested_points):
+        raise ValueError("OSRM returned an invalid waypoint count")
 
     snapped: list[dict] = []
-    for requested, waypoint in zip((start, end), waypoints):
+    for index, (requested, waypoint) in enumerate(zip(requested_points, waypoints)):
         location = waypoint.get("location") if isinstance(waypoint, dict) else None
         if not isinstance(location, list) or len(location) < 2:
             raise ValueError("OSRM returned malformed waypoint")
         lng, lat = float(location[0]), float(location[1])
         if not math.isfinite(lat) or not math.isfinite(lng) or not (-90 <= lat <= 90 and -180 <= lng <= 180):
             raise ValueError("OSRM returned invalid waypoint coordinates")
-        if haversine_m(requested["lat"], requested["lng"], lat, lng) > 500:
-            raise HTTPException(422, detail={"code": "SNAP_TOO_FAR", "message": "Ближайшая дорога находится дальше 500 м от указанной точки"})
+        max_snap_m = 50 if 0 < index < len(requested_points) - 1 else 500
+        snap_distance = haversine_m(requested["lat"], requested["lng"], lat, lng)
+        if snap_distance > max_snap_m:
+            label = f"промежуточной точки {index}" if max_snap_m == 50 else "указанной точки"
+            raise HTTPException(422, detail={"code": "SNAP_TOO_FAR", "message": f"Ближайшая дорога дальше допустимых {max_snap_m} м от {label}", "details": {"waypoint_index": index, "distance_m": round(snap_distance, 1), "max_distance_m": max_snap_m}})
         snapped.append({"lat": lat, "lng": lng})
 
     options: list[dict] = []
@@ -496,6 +589,12 @@ def parse_osrm_preview(payload: Any, start: dict, end: dict) -> tuple[dict, dict
                 if not math.isfinite(lat) or not math.isfinite(lng) or not (-90 <= lat <= 90 and -180 <= lng <= 180):
                     raise ValueError("coordinate outside valid range")
                 normalized.append([lng, lat])
+            last_via_index = -1
+            for via_point in snapped[1:-1]:
+                via_index = next((coord_index for coord_index in range(last_via_index + 1, len(normalized)) if haversine_m(via_point["lat"], via_point["lng"], normalized[coord_index][1], normalized[coord_index][0]) <= 50), None)
+                if via_index is None:
+                    raise ValueError("OSRM route geometry does not pass through each requested via point")
+                last_via_index = via_index
             summary_names = []
             for leg in candidate.get("legs", []):
                 for step in leg.get("steps", []):
@@ -515,40 +614,19 @@ def parse_osrm_preview(payload: Any, start: dict, end: dict) -> tuple[dict, dict
     if not options:
         raise HTTPException(422, detail={"code": "NO_ROUTE", "message": "Дорожный маршрут между точками не найден"})
 
-    def common_prefix_end(left: list[list[float]], right: list[list[float]]) -> tuple[float, float] | None:
-        i = j = 0
-        last_common = None
-        tolerance_m = 20
-        while i < len(left) and j < len(right):
-            left_lng, left_lat = left[i]
-            right_lng, right_lat = right[j]
-            if haversine_m(left_lat, left_lng, right_lat, right_lng) <= tolerance_m:
-                last_common = ((left_lat + right_lat) / 2, (left_lng + right_lng) / 2)
-                i += 1
-                j += 1
-                continue
-            if i + 1 < len(left) and haversine_m(left[i + 1][1], left[i + 1][0], right_lat, right_lng) <= tolerance_m:
-                i += 1
-                continue
-            if j + 1 < len(right) and haversine_m(left_lat, left_lng, right[j + 1][1], right[j + 1][0]) <= tolerance_m:
-                j += 1
-                continue
-            break
-        return last_common
-
     decision_points: list[dict] = []
     for i in range(len(options)):
         for j in range(i + 1, len(options)):
             left = options[i]["geometry"]["coordinates"]
             right = options[j]["geometry"]["coordinates"]
-            fork = common_prefix_end(left, right)
-            if not fork:
-                continue
-            lat, lng = fork
-            if any(haversine_m(lat, lng, point["lat"], point["lng"]) <= 50 for point in decision_points):
-                continue
-            decision_points.append({"lat": lat, "lng": lng, "label": f"Различие вариантов {i + 1} и {j + 1}"})
-    return snapped[0], snapped[1], options, decision_points
+            for lat, lng in _route_divergence_starts(left, right):
+                # Collapse duplicate pairwise reports of the same junction while
+                # preserving separate nearby forks along the route.
+                if any(haversine_m(lat, lng, point["lat"], point["lng"]) <= 8 for point in decision_points):
+                    continue
+                decision_number = len(decision_points) + 1
+                decision_points.append({"lat": lat, "lng": lng, "label": f"Развилка {decision_number}: варианты {i + 1} и {j + 1}"})
+    return snapped[0], snapped[1:-1], snapped[-1], options, decision_points
 
 
 def defect_data(row: DefectRow, db: Session, detail: bool = False) -> dict:
@@ -1134,10 +1212,12 @@ def health():
 def create_route_preview(body: RoutePreviewBody, user: UserRow = Depends(current_user), db: Session = Depends(db_dep)):
     require_role(user, "dispatcher")
     start, end = body.start.model_dump(), body.end.model_dump()
-    if start == end:
-        raise HTTPException(422, detail={"code": "IDENTICAL_POINTS", "message": "Начальная и конечная точки должны различаться"})
+    requested_via = [point.model_dump() for point in body.via]
+    all_points = [start, *requested_via, end]
+    if len({(point["lat"], point["lng"]) for point in all_points}) != len(all_points):
+        raise HTTPException(422, detail={"code": "IDENTICAL_POINTS", "message": "Точки маршрута должны различаться"})
     try:
-        provider_data = fetch_osrm_routes(start, end)
+        provider_data = fetch_osrm_routes(start, end, requested_via) if requested_via else fetch_osrm_routes(start, end)
     except (httpx.TimeoutException, TimeoutError):
         raise HTTPException(503, detail={"code": "ROUTING_TIMEOUT", "message": "Сервис маршрутизации не ответил вовремя. Повторите запрос"})
     except httpx.HTTPError:
@@ -1145,18 +1225,18 @@ def create_route_preview(body: RoutePreviewBody, user: UserRow = Depends(current
     except (ValueError, json.JSONDecodeError):
         raise HTTPException(503, detail={"code": "INVALID_ROUTING_RESPONSE", "message": "Сервис маршрутизации вернул некорректный ответ"})
     try:
-        snapped_start, snapped_end, options, decision_points = parse_osrm_preview(provider_data, start, end)
+        snapped_start, snapped_via, snapped_end, options, decision_points = parse_osrm_preview(provider_data, start, end, requested_via)
     except HTTPException:
         raise
     except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
         raise HTTPException(503, detail={"code": "INVALID_ROUTING_RESPONSE", "message": "Сервис маршрутизации вернул некорректный ответ"})
     row = RoutePreviewRow(
         id=str(uuid.uuid4()), owner_id=user.id, expires_at=utcnow() + timedelta(minutes=60),
-        start=snapped_start, end=snapped_end, options=options, decision_points=decision_points, provider="OSRM",
+        start=snapped_start, via=snapped_via, end=snapped_end, options=options, decision_points=decision_points, provider="OSRM",
     )
     db.add(row)
     db.commit()
-    return {"id": row.id, "expires_at": iso(row.expires_at), "start": row.start, "end": row.end, "options": row.options, "decision_points": row.decision_points, "provider": row.provider}
+    return {"id": row.id, "expires_at": iso(row.expires_at), "start": row.start, "via": row.via or [], "end": row.end, "options": row.options, "decision_points": row.decision_points, "provider": row.provider}
 
 
 @app.post("/api/routes")
@@ -1204,7 +1284,7 @@ def publish_route(body: RoutePublishBody, user: UserRow = Depends(current_user),
     route = RouteRow(
         id=str(uuid.uuid4()), code=route_code, name=normalized_name, notes=normalized_notes,
         inspector_id=inspector.id, source="osrm", is_demo=False,
-        start=preview.start, end=preview.end, geometry=option["geometry"],
+        start=preview.start, via=preview.via or [], end=preview.end, geometry=option["geometry"],
         length_km=float(option["distance_m"]) / 1000.0, duration_s=float(option["duration_s"]),
         created_at=utcnow(), preview_id=preview.id,
     )
@@ -1364,9 +1444,15 @@ def route_results(route_id: str, user: UserRow = Depends(current_user), db: Sess
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "Маршрут не найден"})
     inspection_rows = db.scalars(select(InspectionRow).where(InspectionRow.section_id == route_id).order_by(InspectionRow.started_at.desc())).all()
     defect_rows = db.scalars(select(DefectRow).where(DefectRow.section_id == route_id).order_by(DefectRow.received_at.desc())).all()
+    inspections = []
+    for row in inspection_rows:
+        item = inspection_data(row)
+        inspector = db.get(UserRow, row.inspector_id)
+        item["inspector_name"] = inspector.name if inspector else None
+        inspections.append(item)
     return {
         "route": route_data(route, db),
-        "inspections": [inspection_data(row) for row in inspection_rows],
+        "inspections": inspections,
         "defects": [defect_data(row, db, True) for row in defect_rows],
     }
 

@@ -6,6 +6,7 @@ import threading
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+import math
 
 # Keep both test database and uploads away from the app's live local data.
 os.environ["DATABASE_URL"] = "sqlite://"
@@ -813,7 +814,7 @@ def osrm_response(*, multiple=False):
     }]
     if multiple:
         routes.append({
-            "geometry": {"type": "LineString", "coordinates": [[65.5001, 44.8001], [65.5100, 44.8100], [65.5350, 44.8350], [65.5501, 44.8501]]},
+            "geometry": {"type": "LineString", "coordinates": [[65.5001, 44.8001], [65.5100, 44.8100], [65.5200, 44.8206], [65.5350, 44.8350], [65.5501, 44.8501]]},
             "distance": 7100, "duration": 530,
             "legs": [{"steps": [{"name": "Жибек жолы"}]}],
         })
@@ -853,8 +854,9 @@ def test_route_preview_persists_osrm_alternatives_and_requires_explicit_choice(m
     assert len(data["options"]) == 2
     assert data["options"][0]["distance_m"] == 6400
     assert data["decision_points"]
-    assert abs(data["decision_points"][0]["lat"] - 44.81) < 1e-6
-    assert abs(data["decision_points"][0]["lng"] - 65.51) < 1e-6
+    assert data["decision_points"][0]["label"].startswith("Развилка 1:")
+    assert 44.81 < data["decision_points"][0]["lat"] < 44.83
+    assert 65.51 < data["decision_points"][0]["lng"] < 65.53
 
     missing = publish_route(data, None)
     assert missing.status_code == 422
@@ -872,6 +874,82 @@ def test_route_preview_persists_osrm_alternatives_and_requires_explicit_choice(m
     changed = publish_route(data, data["options"][0]["id"], name="Другой маршрут")
     assert changed.status_code == 409
     assert changed.json()["code"] == "PREVIEW_ALREADY_USED"
+
+
+def test_published_legacy_preview_without_via_allows_identical_retry(monkeypatch):
+    login("dispatcher@roads.local")
+    preview = preview_route(monkeypatch).json()
+    option_id = preview["options"][0]["id"]
+    published = publish_route(preview, option_id)
+    assert published.status_code == 200, published.text
+    route_id = published.json()["id"]
+
+    legacy_payload = {
+        "name": "Проверка R-02", "notes": "Северная объездная",
+        "inspector_id": "u-inspector", "preview_id": preview["id"], "option_id": option_id,
+    }
+    legacy_hash = main.hashlib.sha256(main.json.dumps(
+        legacy_payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    ).encode()).hexdigest()
+    with SessionLocal() as db:
+        saved_preview = db.get(main.RoutePreviewRow, preview["id"])
+        saved_preview.via = None  # Existing rows added by the nullable-column migration.
+        saved_preview.payload_hash = legacy_hash
+        saved_route = db.get(main.RouteRow, route_id)
+        saved_route.via = None
+        db.commit()
+
+    retried = publish_route(preview, option_id)
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["id"] == route_id
+
+
+def test_route_divergences_include_repeated_forks_and_short_detours():
+    start = {"lat": 44.8, "lng": 65.5}
+    end = {"lat": 44.85, "lng": 65.55}
+    cos_lat = math.cos(math.radians(start["lat"]))
+    east_scale = 111_320 * cos_lat
+    north_scale = 111_320
+    dx = (end["lng"] - start["lng"]) * east_scale
+    dy = (end["lat"] - start["lat"]) * north_scale
+    length = (dx * dx + dy * dy) ** 0.5
+    normal_x, normal_y = -dy / length, dx / length
+
+    def point(fraction, offset_m=0):
+        east = (end["lng"] - start["lng"]) * east_scale * fraction + normal_x * offset_m
+        north = (end["lat"] - start["lat"]) * north_scale * fraction + normal_y * offset_m
+        return [start["lng"] + east / east_scale, start["lat"] + north / north_scale]
+
+    def offset(fraction):
+        # Two short lateral detours, each with a 35–40 m maximum separation.
+        for lo, peak, hi, height in ((0.14, 0.17, 0.20, 35), (0.62, 0.65, 0.68, -40)):
+            if lo <= fraction <= peak:
+                return height * (fraction - lo) / (peak - lo)
+            if peak < fraction <= hi:
+                return height * (hi - fraction) / (hi - peak)
+        return 0
+
+    # Unequal vertex density on the same shared portions must not create forks.
+    sparse = [point(fraction) for fraction in (0, .08, .19, .34, .50, .76, 1)]
+    dense = [point(index / 100, offset(index / 100)) for index in range(101)]
+    payload = {
+        "code": "Ok",
+        "waypoints": [{"location": [start["lng"], start["lat"]]}, {"location": [end["lng"], end["lat"]]}],
+        "routes": [
+            {"geometry": {"type": "LineString", "coordinates": sparse}, "distance": 7000, "duration": 500},
+            {"geometry": {"type": "LineString", "coordinates": dense}, "distance": 7100, "duration": 510},
+        ],
+    }
+    _, _, _, _, decisions = main.parse_osrm_preview(payload, start, end)
+    assert len(decisions) == 2
+    assert [item["label"] for item in decisions] == ["Развилка 1: варианты 1 и 2", "Развилка 2: варианты 1 и 2"]
+    decision_fractions = [
+        ((item["lng"] - start["lng"]) * east_scale * dx + (item["lat"] - start["lat"]) * north_scale * dy) / (length * length)
+        for item in decisions
+    ]
+    assert decision_fractions == sorted(decision_fractions)
+    assert 0.13 < decision_fractions[0] < 0.18
+    assert 0.61 < decision_fractions[1] < 0.66
 
 
 def test_route_preview_rejects_invalid_points_and_provider_failures(monkeypatch):
@@ -906,6 +984,116 @@ def test_route_preview_rejects_invalid_points_and_provider_failures(monkeypatch)
     })
     assert malformed.status_code == 503
     assert malformed.json()["code"] == "INVALID_ROUTING_RESPONSE"
+
+
+def test_long_route_sampling_uses_shared_line_without_false_forks():
+    left = [[0.0, 45.0], [10.0, 45.0]]
+    right = [[index / 1000, 45.0] for index in range(10001)]
+    assert main._route_divergence_starts(left, right) == []
+
+    offset_lat = 40 / 111_320
+    detour = [
+        [0.0, 45.0], [6.0, 45.0], [6.2, 45.0 + offset_lat],
+        [7.8, 45.0 + offset_lat], [8.0, 45.0], [10.0, 45.0],
+    ]
+    starts = main._route_divergence_starts(left, detour)
+    assert len(starts) == 1
+    assert 6.0 < starts[0][1] < 6.3
+
+
+def test_route_preview_with_via_uses_ordered_points_and_persists_snapped_via(monkeypatch):
+    calls = []
+    via_point = {"lat": 44.82, "lng": 65.52}
+    payload = {
+        "code": "Ok",
+        "waypoints": [
+            {"location": [65.5001, 44.8001]},
+            {"location": [65.5201, 44.8201]},
+            {"location": [65.5501, 44.8501]},
+        ],
+        "routes": [{
+            "geometry": {"type": "LineString", "coordinates": [[65.5001, 44.8001], [65.5100, 44.8100], [65.5201, 44.8201], [65.5400, 44.8400], [65.5501, 44.8501]]},
+            "distance": 7100, "duration": 600,
+            "legs": [{"steps": [{"name": "Малая дорога"}]}, {"steps": [{"name": "К развилке"}] }],
+        }],
+    }
+
+    class RoutingResponse:
+        is_error = False
+        def json(self):
+            return payload
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs["params"]))
+        return RoutingResponse()
+
+    monkeypatch.setattr(main.httpx, "get", fake_get)
+    login("dispatcher@roads.local")
+    preview_response = client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5}, "via": [via_point], "end": {"lat": 44.85, "lng": 65.55},
+    })
+    assert preview_response.status_code == 200, preview_response.text
+    preview = preview_response.json()
+    expected_coordinates = "65.5,44.8;65.52,44.82;65.55,44.85"
+    assert calls[0][0].endswith(f"/route/v1/driving/{expected_coordinates}")
+    assert calls[0][1]["radiuses"] == "500;50;500"
+    assert calls[0][1]["alternatives"] in (False, "false")
+    assert preview["via"] == [{"lat": 44.8201, "lng": 65.5201}]
+    coordinates = preview["options"][0]["geometry"]["coordinates"]
+    assert [65.5201, 44.8201] in coordinates
+
+    published = publish_route(preview, preview["options"][0]["id"])
+    assert published.status_code == 200, published.text
+    assert published.json()["via"] == preview["via"]
+    with SessionLocal() as db:
+        saved_preview = db.get(main.RoutePreviewRow, preview["id"])
+        saved_route = db.get(main.RouteRow, published.json()["id"])
+        assert saved_preview.via == preview["via"]
+        assert saved_route.via == preview["via"]
+
+
+def test_via_snap_is_limited_to_50m_and_maximum_eight_vias_is_enforced(monkeypatch):
+    login("dispatcher@roads.local")
+    calls = []
+    far_payload = {
+        "code": "Ok",
+        "waypoints": [
+            {"location": [65.5001, 44.8001]},
+            {"location": [65.5210, 44.8210]},
+            {"location": [65.5501, 44.8501]},
+        ],
+        "routes": [{"geometry": {"type": "LineString", "coordinates": [[65.5001, 44.8001], [65.5501, 44.8501]]}, "distance": 6000, "duration": 600}],
+    }
+
+    class RoutingResponse:
+        is_error = False
+        def json(self):
+            return far_payload
+
+    monkeypatch.setattr(main.httpx, "get", lambda *args, **kwargs: (calls.append(kwargs["params"]) or RoutingResponse()))
+    rejected = client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5}, "via": [{"lat": 44.82, "lng": 65.52}], "end": {"lat": 44.85, "lng": 65.55},
+    })
+    assert rejected.status_code == 422
+    assert rejected.json()["code"] == "SNAP_TOO_FAR"
+    assert calls[0]["radiuses"] == "500;50;500"
+
+    oversized = client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5},
+        "via": [{"lat": 44.801 + index * 0.001, "lng": 65.501 + index * 0.001} for index in range(9)],
+        "end": {"lat": 44.85, "lng": 65.55},
+    })
+    assert oversized.status_code == 422
+    assert oversized.json()["code"] == "VALIDATION_ERROR"
+
+
+def test_via_preview_remains_dispatcher_only(monkeypatch):
+    monkeypatch.setattr(main, "fetch_osrm_routes", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("router should not be called")))
+    login("inspector@roads.local")
+    response = client.post("/api/routes/preview", json={
+        "start": {"lat": 44.8, "lng": 65.5}, "via": [{"lat": 44.82, "lng": 65.52}], "end": {"lat": 44.85, "lng": 65.55},
+    })
+    assert response.status_code == 403
 
 
 def test_osrm_http_400_no_route_is_reported_as_no_route(monkeypatch):
@@ -999,4 +1187,5 @@ def test_assigned_route_results_preserve_geometry_inspections_and_defects(monkey
     data = result.json()
     assert data["route"]["geometry"] == route["geometry"]
     assert data["inspections"][0]["points"] == [point]
+    assert data["inspections"][0]["inspector_name"] == "Айгуль Нуртаева"
     assert any(item["id"] == defect.json()["id"] for item in data["defects"])

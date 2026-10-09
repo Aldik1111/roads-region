@@ -6,6 +6,7 @@ type LocationState = {
   position: DevicePosition | null;
   ready: boolean;
   hasFreshPosition: boolean;
+  precision: 'precise' | 'approximate' | 'unknown';
   error: string;
   status: 'requesting' | 'ready' | 'reconnecting' | 'unavailable';
   recoveryRemainingSeconds: number;
@@ -64,6 +65,8 @@ export function LocationProvider({ children, requireGps = false }: { children: R
     let retryTimer: number | null = null;
     let refreshInFlight = false;
     let refreshForFix = '';
+    let deferredCoarseFix: DevicePosition | null = null;
+    let fallbackInFlight = false;
     let permissionGrantedRestarted = false;
     const inRecovery = (at = Date.now()) => recoveryDeadlineRef.current !== null && recoveryDeadlineRef.current > at;
     const beginRecovery = (fix: DevicePosition) => {
@@ -89,6 +92,7 @@ export function LocationProvider({ children, requireGps = false }: { children: R
     const stopWatch = () => {
       generation += 1;
       refreshInFlight = false;
+      fallbackInFlight = false;
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       retryTimer = null;
       if (watchId !== null) navigator.geolocation?.clearWatch(watchId);
@@ -99,12 +103,16 @@ export function LocationProvider({ children, requireGps = false }: { children: R
       refreshForFix = '';
       clearRecovery();
       latest.current = null;
+      deferredCoarseFix = null;
+      fallbackInFlight = false;
       setPosition(null);
       setError(message);
       setRequesting(false);
     };
     const recordProviderIssue = (message: string) => {
       providerIssueRef.current = message;
+      // A coarse sample gathered before the loss report cannot repair that loss.
+      deferredCoarseFix = null;
       setError(message);
       if (latest.current) {
         beginRecovery(latest.current);
@@ -129,12 +137,18 @@ export function LocationProvider({ children, requireGps = false }: { children: R
       if (disposed || denied || document.visibilityState !== 'visible') return;
       if (latest.current && fix.timestamp <= Date.parse(latest.current.recorded_at)) return;
       const age = Date.now() - fix.timestamp;
-      if (!Number.isFinite(fix.timestamp) || age > MAX_FIX_AGE_MS || age < -5000 || !Number.isFinite(fix.coords.latitude) || !Number.isFinite(fix.coords.longitude) || !Number.isFinite(fix.coords.accuracy)) {
+      if (!Number.isFinite(fix.timestamp) || age > MAX_FIX_AGE_MS || age < -5000 || !Number.isFinite(fix.coords.latitude) || fix.coords.latitude < -90 || fix.coords.latitude > 90 || !Number.isFinite(fix.coords.longitude) || fix.coords.longitude < -180 || fix.coords.longitude > 180 || !Number.isFinite(fix.coords.accuracy) || fix.coords.accuracy < 0) {
         recordProviderIssue('Браузер не получил актуальную позицию. Повторяем поиск GPS.');
         scheduleRecovery();
         return;
       }
       const next = { lat: fix.coords.latitude, lng: fix.coords.longitude, accuracy_m: fix.coords.accuracy, recorded_at: new Date(fix.timestamp).toISOString() };
+      const previous = latest.current;
+      if (!providerIssueRef.current && previous && hasFreshFix(previous) && previous.accuracy_m <= 100 && next.accuracy_m > Math.max(100, previous.accuracy_m * 3)) {
+        if (!deferredCoarseFix || next.accuracy_m < deferredCoarseFix.accuracy_m) deferredCoarseFix = next;
+        return;
+      }
+      deferredCoarseFix = null;
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       retryTimer = null;
       lastFailure = null;
@@ -147,7 +161,7 @@ export function LocationProvider({ children, requireGps = false }: { children: R
       setClock(Date.now());
     };
 
-    const failed = (failure: GeolocationPositionError) => {
+    const failed = (failure: GeolocationPositionError, allowFallback = true) => {
       if (disposed) return;
       lastFailure = failure;
       if (failure.code === 1 && (pagePermission === 'denied' || locationPolicyBlocked())) {
@@ -174,12 +188,36 @@ export function LocationProvider({ children, requireGps = false }: { children: R
         : pagePermission === 'granted'
           ? `Браузер разрешил сайту геолокацию, но источник устройства пока не вернул позицию. Повторим поиск автоматически.${windowsLocationHelp()}`
           : `Источник геолокации пока не вернул позицию. Включите системную геолокацию и повторите попытку.${windowsLocationHelp()}`;
+      // Revoke live-fix access as soon as the provider reports loss. The fallback is
+      // only a way to acquire a replacement; it must not keep the previous fix live.
       recordProviderIssue(message);
+      if (allowFallback && (failure.code === 2 || failure.code === 3) && !fallbackInFlight && navigator.geolocation) {
+        if (!latest.current) setRequesting(true);
+        stopWatch();
+        fallbackInFlight = true;
+        const fallbackGeneration = generation;
+        const fallbackStartedAt = Date.now();
+        navigator.geolocation.getCurrentPosition(fix => {
+          if (disposed || fallbackGeneration !== generation) return;
+          fallbackInFlight = false;
+          if (fix.timestamp < fallbackStartedAt) {
+            scheduleRecovery();
+            return;
+          }
+          fresh(fix);
+          if (hasFreshFix(latest.current)) startWatch();
+        }, fallbackFailure => {
+          if (disposed || fallbackGeneration !== generation) return;
+          fallbackInFlight = false;
+          failed(fallbackFailure, false);
+        }, { enableHighAccuracy: false, maximumAge: 0, timeout: 8000 });
+        return;
+      }
       scheduleRecovery();
     };
 
-    const options: PositionOptions = { enableHighAccuracy: false, maximumAge: 5000, timeout: 20000 };
-    const refreshOptions: PositionOptions = { enableHighAccuracy: false, maximumAge: 0, timeout: 8000 };
+    const options: PositionOptions = { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 };
+    const refreshOptions: PositionOptions = { enableHighAccuracy: true, maximumAge: 0, timeout: 8000 };
     const startWatch = () => {
       stopWatch();
       if (disposed || denied || document.visibilityState !== 'visible' || !navigator.geolocation) return;
@@ -263,6 +301,18 @@ export function LocationProvider({ children, requireGps = false }: { children: R
       setClock(now);
       const fix = latest.current;
       if (!fix) return;
+      if (document.visibilityState === 'visible' && !hasFreshFix(fix) && deferredCoarseFix && hasFreshFix(deferredCoarseFix)) {
+        const coarse = deferredCoarseFix;
+        deferredCoarseFix = null;
+        latest.current = coarse;
+        providerIssueRef.current = '';
+        setPosition(coarse);
+        setError('');
+        setRequesting(false);
+        clearRecovery();
+        setClock(now);
+        return;
+      }
       const age = Date.now() - Date.parse(fix.recorded_at);
       if (!hasFreshFix(fix)) {
         if (recoveryForFixRef.current !== fix.recorded_at) {
@@ -281,7 +331,16 @@ export function LocationProvider({ children, requireGps = false }: { children: R
     }, 1000);
     const visibility = () => {
       if (document.visibilityState === 'visible') {
-        const fix = latest.current;
+        let fix = latest.current;
+        if (fix && !hasFreshFix(fix) && deferredCoarseFix && hasFreshFix(deferredCoarseFix)) {
+          latest.current = deferredCoarseFix;
+          setPosition(deferredCoarseFix);
+          deferredCoarseFix = null;
+          providerIssueRef.current = '';
+          setError('');
+          clearRecovery();
+          fix = latest.current;
+        }
         if (fix && !hasFreshFix(fix) && recoveryForFixRef.current !== fix.recorded_at) {
           if (!providerIssueRef.current) {
             providerIssueRef.current = 'GPS-сигнал потерян. Работа приостановлена до получения актуальной позиции.';
@@ -317,6 +376,7 @@ export function LocationProvider({ children, requireGps = false }: { children: R
 
   const value = useMemo<LocationState>(() => {
     const hasFreshPosition = hasFreshFix(position) && !error;
+    const precision = hasFreshPosition && position ? (position.accuracy_m <= 100 ? 'precise' : 'approximate') : 'unknown';
     const recoveryRemainingSeconds = recoveryDeadline === null ? 0 : Math.max(0, Math.ceil((recoveryDeadline - clock) / 1000));
     const recovering = recoveryRemainingSeconds > 0;
     const ready = hasFreshPosition || recovering;
@@ -325,6 +385,7 @@ export function LocationProvider({ children, requireGps = false }: { children: R
       position: hasFreshPosition ? position : null,
       ready,
       hasFreshPosition,
+      precision,
       error,
       status: hasFreshPosition ? 'ready' : recovering ? 'reconnecting' : recoveryDeadline !== null ? 'unavailable' : requesting ? 'requesting' : 'unavailable',
       recoveryRemainingSeconds,
