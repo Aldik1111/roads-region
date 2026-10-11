@@ -33,6 +33,11 @@ export default function Inspector({ user, onLogout,target }: { user: User; onLog
   const [inspections, setInspections] = useState<Inspection[]>([]);
   const [defects, setDefects] = useState<Defect[]>([]);
   const [inspection, setInspection] = useState<Inspection | null>(null);
+  useEffect(() => {
+    const host = window as Window & {__roadsNativeContext?: {inspectionId: string | null; userId: string}};
+    host.__roadsNativeContext = {inspectionId: inspection?.status === 'active' ? inspection.id : null, userId: user.id};
+    return () => { delete host.__roadsNativeContext; };
+  }, [inspection?.id, inspection?.status, user.id]);
   const [section, setSection] = useState<Section | null>(null);
   const [routeResults, setRouteResults] = useState<RouteResults | null>(null);
   const [historyInspectionId, setHistoryInspectionId] = useState<string | null>(null);
